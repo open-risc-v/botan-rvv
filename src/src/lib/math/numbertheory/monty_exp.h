@@ -1,0 +1,91 @@
+/*
+* (C) 2018,2025 Jack Lloyd
+*
+* Botan is released under the Simplified BSD License (see license.txt)
+*/
+
+#ifndef BOTAN_MONTY_EXP_H_
+#define BOTAN_MONTY_EXP_H_
+
+#include <botan/internal/monty.h>
+#include <memory>
+
+namespace Botan {
+
+class BigInt;
+
+/**
+* Precomputed state for computing g^x mod p
+*/
+class Montgomery_Exponentiation_State {
+   public:
+      virtual ~Montgomery_Exponentiation_State() = default;
+
+      Montgomery_Exponentiation_State(const Montgomery_Exponentiation_State& other) = delete;
+      Montgomery_Exponentiation_State(Montgomery_Exponentiation_State&& other) = delete;
+
+      Montgomery_Exponentiation_State& operator=(const Montgomery_Exponentiation_State& other) = delete;
+      Montgomery_Exponentiation_State& operator=(Montgomery_Exponentiation_State&& other) = delete;
+
+      /**
+      * Return g^k mod p, in time independent of k (assuming k is at most max_k_bits long)
+      */
+      virtual Montgomery_Int exponentiation(const BigInt& k, size_t max_k_bits) const = 0;
+
+      /**
+      * Return g^k mod p in variable time
+      */
+      virtual Montgomery_Int exponentiation_vartime(const BigInt& k) const = 0;
+
+   protected:
+      Montgomery_Exponentiation_State() = default;
+};
+
+/*
+* Precompute for calculating values g^x mod p
+*/
+BOTAN_TEST_API std::shared_ptr<const Montgomery_Exponentiation_State> monty_precompute(
+   const Montgomery_Params& params_p, const BigInt& g, size_t window_bits);
+
+/*
+* Precompute for calculating values g^x mod p
+*/
+BOTAN_TEST_API std::shared_ptr<const Montgomery_Exponentiation_State> monty_precompute(const Montgomery_Int& g,
+                                                                                       size_t window_bits);
+
+/*
+* Return g^k mod p
+*/
+BOTAN_TEST_API Montgomery_Int monty_execute(const Montgomery_Exponentiation_State& precomputed_state,
+                                            const BigInt& k,
+                                            size_t max_k_bits);
+
+/*
+* Return g^k mod p taking variable time depending on k
+* @warning only use this if k is public
+*/
+BOTAN_TEST_API Montgomery_Int monty_execute_vartime(const Montgomery_Exponentiation_State& precomputed_state,
+                                                    const BigInt& k);
+
+inline Montgomery_Int monty_exp(const Montgomery_Params& params_p,
+                                const BigInt& g,
+                                const BigInt& k,
+                                size_t max_k_bits) {
+   const auto precomputed = monty_precompute(params_p, g, 4);
+   return monty_execute(*precomputed, k, max_k_bits);
+}
+
+inline Montgomery_Int monty_exp_vartime(const Montgomery_Params& params_p, const BigInt& g, const BigInt& k) {
+   const auto precomputed = monty_precompute(params_p, g, 4);
+   return monty_execute_vartime(*precomputed, k);
+}
+
+/**
+* Return (x^z1 * y^z2) % p
+*/
+Montgomery_Int monty_multi_exp(
+   const Montgomery_Params& params_p, const BigInt& x, const BigInt& z1, const BigInt& y, const BigInt& z2);
+
+}  // namespace Botan
+
+#endif

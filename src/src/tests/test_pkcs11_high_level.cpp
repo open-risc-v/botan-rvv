@@ -1,0 +1,2035 @@
+/*
+* (C) 2016 Daniel Neus
+* (C) 2016 Philipp Weber
+* (C) 2019 Michael Boric
+* (C) 2020 René Korthaus
+*
+* Botan is released under the Simplified BSD License (see license.txt)
+*/
+
+#include "tests.h"
+
+#if defined(BOTAN_HAS_PKCS11)
+   #include "test_pkcs11.h"
+   #include <botan/p11.h>
+   #include <botan/p11_object.h>
+   #include <botan/p11_randomgenerator.h>
+   #include <botan/internal/fmt.h>
+   #include <algorithm>
+   #include <cstring>
+   #include <memory>
+   #include <numeric>
+   #include <optional>
+   #include <sstream>
+   #include <string>
+   #include <vector>
+#endif
+
+#if defined(BOTAN_HAS_ASN1)
+   #include <botan/der_enc.h>
+#endif
+
+#if defined(BOTAN_HAS_ENTROPY_SOURCE)
+   #include <botan/entropy_src.h>
+#endif
+
+#if defined(BOTAN_HAS_PUBLIC_KEY_CRYPTO)
+   #include <botan/pubkey.h>
+#endif
+
+#if defined(BOTAN_HAS_ECC_GROUP)
+   #include <botan/ec_group.h>
+#endif
+
+#if defined(BOTAN_HAS_RSA) && defined(BOTAN_HAS_PKCS11)
+   #include <botan/p11_rsa.h>
+   #include <botan/pss_params.h>
+   #include <botan/rsa.h>
+#endif
+
+#if defined(BOTAN_HAS_ECDSA) && defined(BOTAN_HAS_PKCS11)
+   #include <botan/ecdsa.h>
+   #include <botan/p11_ecdsa.h>
+#endif
+
+#if defined(BOTAN_HAS_ECDH) && defined(BOTAN_HAS_PKCS11)
+   #include <botan/ecdh.h>
+   #include <botan/p11_ecdh.h>
+#endif
+
+#if defined(BOTAN_HAS_X509_CERTIFICATES) && defined(BOTAN_HAS_PKCS11)
+   #include <botan/p11_x509.h>
+   #include <botan/pkix_types.h>
+#endif
+
+#if defined(BOTAN_HAS_HMAC_DRBG)
+   #include <botan/hmac_drbg.h>
+   #include <botan/mac.h>
+#endif
+
+namespace Botan_Tests {
+
+#if defined(BOTAN_HAS_PKCS11)
+
+std::vector<Test::Result> run_pkcs11_tests(
+   const std::string& name, const std::vector<std::pair<std::string, std::function<Test::Result()>>>& fns) {
+   std::vector<Test::Result> results;
+
+   for(const auto& [fn_name, fn] : fns) {
+      try {
+         results.push_back(fn());
+      } catch(Botan::PKCS11::PKCS11_ReturnError& e) {
+         results.push_back(Test::Result::Failure(Botan::fmt("{} test {}", name, fn_name), e.what()));
+
+         if(e.get_return_value() == Botan::PKCS11::ReturnValue::PinIncorrect) {
+            break;  // Do not continue to not potentially lock the token
+         }
+      } catch(std::exception& e) {
+         results.push_back(Test::Result::Failure(Botan::fmt("{} test {}", name, fn_name), e.what()));
+      }
+   }
+
+   return results;
+}
+
+namespace {
+
+using namespace Botan;
+using namespace PKCS11;
+
+size_t count_objects_with_label(Session& session, const std::string& label) {
+   AttributeContainer search_template;
+   search_template.add_string(AttributeType::Label, label);
+   return Object::search<Object>(session, search_template.attributes()).size();
+}
+
+class TestSession {
+   public:
+      explicit TestSession(bool login) : m_module(new Module(Test::pkcs11_lib())) {
+         std::vector<SlotId> slot_vec = Slot::get_available_slots(*m_module, true);
+         m_slot = std::make_unique<Slot>(*m_module, slot_vec.at(0));
+         m_session = std::make_unique<Session>(*m_slot, false);
+         if(login) {
+            m_session->login(UserType::User, PIN());
+         }
+      }
+
+      Session& session() const { return *m_session; }
+
+      Slot& slot() const { return *m_slot; }
+
+   private:
+      std::unique_ptr<Module> m_module = nullptr;
+      std::unique_ptr<Slot> m_slot = nullptr;
+      std::unique_ptr<Session> m_session = nullptr;
+};
+
+/***************************** Module *****************************/
+
+Test::Result test_module_ctor() {
+   Test::Result result("Module ctor");
+
+   result.test_throws("Module ctor fails for non existent path", []() { Module("/a/b/c"); });
+
+   const Module module(Test::pkcs11_lib());
+   result.test_success("Module ctor did not throw and completed successfully");
+
+   return result;
+}
+
+Test::Result test_module_reload() {
+   Test::Result result("Module reload");
+
+   Module module(Test::pkcs11_lib());
+
+   module.reload();
+   result.test_success("Module reload did not throw and completed successfully");
+
+   module.get_info();
+   result.test_success("Module get_info() still works after reload");
+
+   return result;
+}
+
+Test::Result test_module_reload_failure() {
+   Test::Result result("Module reload failure");
+
+   Module module(Test::pkcs11_lib());
+   Slot slot(module, Slot::get_available_slots(module, true).at(0));
+
+   {
+      const Session session(slot, true);
+
+      // pReserved must be NULL, so C_Initialize fails
+      uint8_t reserved = 0;
+      const C_InitializeArgs bad_args = {
+         nullptr, nullptr, nullptr, nullptr, static_cast<CK_FLAGS>(Flag::OsLockingOk), &reserved};
+      result.test_throws("reload with invalid arguments fails", [&]() { module.reload(bad_args); });
+
+      result.test_throws<Botan::Invalid_State>("module is unusable after failed reload", [&]() { module.get_info(); });
+
+      // the session destructor runs against the uninitialized module
+   }
+   result.test_success("Session destructor did not crash after failed reload");
+
+   module.reload();
+   module.get_info();
+   result.test_success("Module can be reloaded after a failed reload");
+
+   return result;
+}
+
+Test::Result test_multiple_modules() {
+   Test::Result result("Module copy");
+   const Module first_module(Test::pkcs11_lib());
+
+   result.test_throws("Module ctor fails if module is already initialized",
+                      []() { const Module second_module(Test::pkcs11_lib()); });
+
+   return result;
+}
+
+Test::Result test_module_get_info() {
+   Test::Result result("Module info");
+
+   const Module module(Test::pkcs11_lib());
+
+   const Info info = module.get_info();
+   result.test_sz_ne("Cryptoki version != 0", info.cryptokiVersion.major, 0);
+
+   return result;
+}
+
+class Module_Tests final : public Test {
+   public:
+      std::vector<Test::Result> run() override {
+         const std::vector<std::pair<std::string, std::function<Test::Result()>>> fns = {
+            {STRING_AND_FUNCTION(test_module_ctor)},
+            {STRING_AND_FUNCTION(test_multiple_modules)},
+            {STRING_AND_FUNCTION(test_module_get_info)},
+            {STRING_AND_FUNCTION(test_module_reload)},
+            {STRING_AND_FUNCTION(test_module_reload_failure)}};
+
+         return run_pkcs11_tests("Module", fns);
+      }
+};
+
+BOTAN_REGISTER_SERIALIZED_TEST("pkcs11", "pkcs11-module", Module_Tests);
+
+/***************************** Slot *****************************/
+
+Test::Result test_slot_get_available_slots() {
+   Test::Result result("Slot get_available_slots");
+
+   Module module(Test::pkcs11_lib());
+   const std::vector<SlotId> slot_vec = Slot::get_available_slots(module, true);
+   result.test_sz_gte("Available Slots with attached token >= 1", slot_vec.size(), 1);
+
+   return result;
+}
+
+Test::Result test_slot_ctor() {
+   Test::Result result("Slot ctor");
+
+   Module module(Test::pkcs11_lib());
+   std::vector<SlotId> slot_vec = Slot::get_available_slots(module, true);
+
+   const Slot slot(module, slot_vec.at(0));
+   result.test_success("Slot ctor completed successfully");
+   result.test_u64_eq(slot.slot_id(), slot_vec.at(0));
+
+   return result;
+}
+
+Test::Result test_get_slot_info() {
+   Test::Result result("Slot get_slot_info");
+
+   Module module(Test::pkcs11_lib());
+   std::vector<SlotId> slot_vec = Slot::get_available_slots(module, true);
+   const Slot slot(module, slot_vec.at(0));
+
+   SlotInfo info = slot.get_slot_info();
+   const std::string description = reinterpret_cast<char*>(info.slotDescription);
+   result.test_is_true("Slot description is not empty", !description.empty());
+
+   return result;
+}
+
+SlotId get_invalid_slot_id(Module& module) {
+   std::vector<SlotId> slot_vec = Slot::get_available_slots(module, false);
+
+   SlotId invalid_id = 0;
+
+   // find invalid slot id
+   while(std::find(slot_vec.begin(), slot_vec.end(), invalid_id) != slot_vec.end()) {
+      invalid_id++;
+   }
+
+   return invalid_id;
+}
+
+Test::Result test_slot_invalid_id() {
+   Test::Result result("Slot get_slot_info with invalid slot id");
+
+   Module module(Test::pkcs11_lib());
+
+   const SlotId invalid_id = get_invalid_slot_id(module);
+
+   Slot slot(module, invalid_id);
+
+   result.test_throws("get_slot_info fails for non existent slot id", [&slot]() { slot.get_slot_info(); });
+
+   return result;
+}
+
+Test::Result test_get_token_info() {
+   Test::Result result("Slot get_token_info");
+
+   Module module(Test::pkcs11_lib());
+   std::vector<SlotId> slot_vec = Slot::get_available_slots(module, true);
+   const Slot slot(module, slot_vec.at(0));
+
+   TokenInfo info = slot.get_token_info();
+   const std::string label = reinterpret_cast<char*>(info.label);
+   result.test_is_true("Token label is not empty", !label.empty());
+
+   return result;
+}
+
+Test::Result test_get_mechanism_list() {
+   Test::Result result("Slot get_mechanism_list");
+
+   Module module(Test::pkcs11_lib());
+   std::vector<SlotId> slot_vec = Slot::get_available_slots(module, true);
+   const Slot slot(module, slot_vec.at(0));
+
+   const std::vector<MechanismType> mechanisms = slot.get_mechanism_list();
+   result.test_is_true("The Slot supports at least one mechanism", !mechanisms.empty());
+
+   return result;
+}
+
+Test::Result test_get_mechanisms_info() {
+   Test::Result result("Slot get_mechanism_info");
+
+   Module module(Test::pkcs11_lib());
+   std::vector<SlotId> slot_vec = Slot::get_available_slots(module, true);
+   const Slot slot(module, slot_vec.at(0));
+
+   slot.get_mechanism_info(MechanismType::RsaPkcsKeyPairGen);
+   result.test_success("get_mechanism_info() completed successfully.");
+
+   return result;
+}
+
+class Slot_Tests final : public Test {
+   public:
+      std::vector<Test::Result> run() override {
+         const std::vector<std::pair<std::string, std::function<Test::Result()>>> fns = {
+            {STRING_AND_FUNCTION(test_slot_get_available_slots)},
+            {STRING_AND_FUNCTION(test_slot_ctor)},
+            {STRING_AND_FUNCTION(test_get_slot_info)},
+            {STRING_AND_FUNCTION(test_slot_invalid_id)},
+            {STRING_AND_FUNCTION(test_get_token_info)},
+            {STRING_AND_FUNCTION(test_get_mechanism_list)},
+            {STRING_AND_FUNCTION(test_get_mechanisms_info)}};
+
+         return run_pkcs11_tests("Slot", fns);
+      }
+};
+
+BOTAN_REGISTER_SERIALIZED_TEST("pkcs11", "pkcs11-slot", Slot_Tests);
+
+/***************************** Session *****************************/
+
+Test::Result test_session_ctor() {
+   Test::Result result("Session ctor");
+
+   Module module(Test::pkcs11_lib());
+   std::vector<SlotId> slot_vec = Slot::get_available_slots(module, true);
+   Slot slot(module, slot_vec.at(0));
+
+   {
+      const Session read_only_session(slot, true);
+      result.test_success("read only session opened successfully");
+   }
+   {
+      const Session read_write_session(slot, false);
+      result.test_success("read write session opened successfully");
+   }
+   {
+      const Flags flags = PKCS11::flags(Flag::SerialSession | Flag::RwSession);
+      const Session read_write_session2(slot, flags, nullptr, nullptr);
+      result.test_success("read write session with flags param opened successfully");
+   }
+   {
+      const Session read_only_session(slot, true);
+      const Session read_write_session(slot, false);
+      result.test_success("Opened multiple sessions successfully");
+   }
+
+   return result;
+}
+
+Test::Result test_session_ctor_invalid_slot() {
+   Test::Result result("Session ctor with invalid slot id");
+
+   Module module(Test::pkcs11_lib());
+
+   const SlotId invalid_id = get_invalid_slot_id(module);
+   Slot slot(module, invalid_id);
+
+   result.test_throws("Session ctor with invalid slot id fails", [&slot]() { Session(slot, true); });
+
+   return result;
+}
+
+Test::Result test_session_release() {
+   Test::Result result("Session release/take ownership");
+
+   Module module(Test::pkcs11_lib());
+   std::vector<SlotId> slot_vec = Slot::get_available_slots(module, true);
+   Slot slot(module, slot_vec.at(0));
+
+   Session session(slot, false);
+   const SessionHandle handle = session.release();
+
+   const Session session2(slot, handle);
+   result.test_success("releasing ownership and taking ownership works as expected.");
+
+   return result;
+}
+
+Test::Result test_session_login_logout() {
+   Test::Result result("Session login/logout");
+
+   Module module(Test::pkcs11_lib());
+   std::vector<SlotId> slot_vec = Slot::get_available_slots(module, true);
+   Slot slot(module, slot_vec.at(0));
+
+   Session session(slot, false);
+   session.login(UserType::User, PIN());
+   session.logoff();
+   result.test_success("user login/logout succeeded");
+
+   session.login(UserType::SO, SO_PIN());
+   result.test_success("SO login succeeded");
+
+   return result;
+}
+
+Test::Result test_session_info() {
+   Test::Result result("Session session info");
+
+   Module module(Test::pkcs11_lib());
+   std::vector<SlotId> slot_vec = Slot::get_available_slots(module, true);
+   Slot slot(module, slot_vec.at(0));
+
+   Session session(slot, false);
+   SessionInfo info = session.get_info();
+   result.test_u64_eq("slot id is correct", info.slotID, slot_vec.at(0));
+   result.test_u64_eq(
+      "state is a read write public session", info.state, static_cast<CK_STATE>(SessionState::RwPublicSession));
+
+   session.login(UserType::User, PIN());
+   info = session.get_info();
+   result.test_u64_eq(
+      "state is a read write user session", info.state, static_cast<CK_STATE>(SessionState::RwUserFunctions));
+
+   session.logoff();
+   result.test_success("user login/logout succeeded");
+
+   session.login(UserType::SO, SO_PIN());
+   result.test_success("SO login succeeded");
+
+   return result;
+}
+
+class Session_Tests final : public Test {
+   public:
+      std::vector<Test::Result> run() override {
+         const std::vector<std::pair<std::string, std::function<Test::Result()>>> fns = {
+            {STRING_AND_FUNCTION(test_session_ctor)},
+            {STRING_AND_FUNCTION(test_session_ctor_invalid_slot)},
+            {STRING_AND_FUNCTION(test_session_release)},
+            {STRING_AND_FUNCTION(test_session_login_logout)},
+            {STRING_AND_FUNCTION(test_session_info)}};
+
+         return run_pkcs11_tests("Session", fns);
+      }
+};
+
+BOTAN_REGISTER_SERIALIZED_TEST("pkcs11", "pkcs11-session", Session_Tests);
+
+/***************************** Object *****************************/
+
+Test::Result test_attribute_container() {
+   Test::Result result("AttributeContainer");
+
+   AttributeContainer attributes;
+   attributes.add_class(ObjectClass::PrivateKey);
+
+   const std::string label("test");
+   attributes.add_string(AttributeType::Label, label);
+
+   const std::vector<uint8_t> bin(4);
+   attributes.add_binary(AttributeType::Value, bin);
+
+   attributes.add_bool(AttributeType::Sensitive, true);
+   attributes.add_numeric(AttributeType::ObjectId, 10);
+   attributes.add_numeric(AttributeType::Id, 20);
+   attributes.add_numeric(AttributeType::PixelX, 30);
+   // Test that overwriting the existing Id attribute works. The numeric attributes above should not be affected by this.
+   attributes.add_numeric(AttributeType::Id, 21);
+   attributes.add_numeric(AttributeType::PixelY, 40);
+
+   result.test_sz_eq("8 elements in attribute container", attributes.count(), 8);
+
+   const std::vector<Botan::PKCS11::Attribute>& storedAttributes = attributes.attributes();
+
+   // Compare the exact bytes the module would read, independent of host endianness
+   const auto published_ulong = [&](const std::string& what, size_t idx, AttributeType type, Ulong expected) {
+      const auto& attr = storedAttributes.at(idx);
+      result.test_u64_eq(what + " type", attr.type, static_cast<CK_ATTRIBUTE_TYPE>(type));
+      result.test_u64_eq(what + " length", attr.ulValueLen, sizeof(Ulong));
+      Ulong value = 0;
+      std::memcpy(&value, attr.pValue, sizeof(Ulong));
+      result.test_u64_eq(what + " value", value, expected);
+   };
+
+   published_ulong("Class", 0, AttributeType::Class, static_cast<CK_OBJECT_CLASS>(ObjectClass::PrivateKey));
+
+   const auto& sensitive = storedAttributes.at(3);
+   result.test_u64_eq("Sensitive type", sensitive.type, static_cast<CK_ATTRIBUTE_TYPE>(AttributeType::Sensitive));
+   result.test_u64_eq("Sensitive length", sensitive.ulValueLen, sizeof(Bbool));
+   result.test_u64_eq("Sensitive value", *static_cast<const Bbool*>(sensitive.pValue), CK_TRUE);
+
+   published_ulong("ObjectId", 4, AttributeType::ObjectId, 10);
+   published_ulong("Id", 5, AttributeType::Id, 21);
+   published_ulong("PixelX", 6, AttributeType::PixelX, 30);
+   published_ulong("PixelY", 7, AttributeType::PixelY, 40);
+
+   // Overwriting a bool must not disturb the numerics or vice versa
+   attributes.add_bool(AttributeType::Sensitive, false);
+   result.test_u64_eq("Sensitive overwritten", *static_cast<const Bbool*>(storedAttributes.at(3).pValue), CK_FALSE);
+   published_ulong("PixelY after bool overwrite", 7, AttributeType::PixelY, 40);
+
+   result.test_throws<Botan::Invalid_Argument>("negative numeric rejected",
+                                               [&]() { attributes.add_numeric(AttributeType::PixelX, -1); });
+
+   return result;
+}
+
+DataObjectProperties make_test_object(const std::string& label) {
+   std::string value_string("test data");
+   const secure_vector<uint8_t> value(value_string.begin(), value_string.end());
+
+   const std::size_t id = 1337;
+   const std::string application = "Botan test application";
+
+   std::vector<uint8_t> encoded_id;
+   DER_Encoder(encoded_id).encode(id);
+
+   DataObjectProperties data_obj_props;
+   data_obj_props.set_application(application);
+   data_obj_props.set_label(label);
+   data_obj_props.set_value(value);
+   data_obj_props.set_token(true);
+   data_obj_props.set_modifiable(true);
+   data_obj_props.set_object_id(encoded_id);
+
+   return data_obj_props;
+}
+
+   #if defined(BOTAN_HAS_ASN1)
+Test::Result test_create_destroy_data_object() {
+   Test::Result result("Object create/delete data object");
+
+   const TestSession test_session(true);
+
+   const std::string label = "Botan test data object";
+   const auto data_obj_props = make_test_object(label);
+   const Object data_obj(test_session.session(), data_obj_props);
+   result.test_success("Data object creation was successful");
+
+   const Object copy_before_destroy(data_obj);  // NOLINT(*-unnecessary-copy-initialization)
+
+   data_obj.destroy();
+   result.test_success("Data object deletion  was successful");
+
+   result.test_u64_eq("handle is invalidated by destroy", data_obj.handle(), CK_INVALID_HANDLE);
+   result.test_throws("destroyed object can no longer be used",
+                      [&]() { data_obj.get_attribute_value(AttributeType::Label); });
+   result.test_throws("destroyed object can not be destroyed again", [&]() { data_obj.destroy(); });
+   result.test_sz_eq("object is gone", count_objects_with_label(test_session.session(), label), 0);
+
+   // copies made before destroy() keep the old handle
+   result.test_sz_ne("copy retains the old handle", copy_before_destroy.handle(), CK_INVALID_HANDLE);
+
+   return result;
+}
+
+Test::Result test_get_set_attribute_values() {
+   Test::Result result("Object get/set attributes");
+
+   const TestSession test_session(true);
+
+   // create object
+   const std::string label = "Botan test data object";
+   const auto data_obj_props = make_test_object(label);
+   const Object data_obj(test_session.session(), data_obj_props);
+
+   // get attribute
+   secure_vector<uint8_t> retrieved_label = data_obj.get_attribute_value(AttributeType::Label);
+   std::string retrieved_label_string(retrieved_label.begin(), retrieved_label.end());
+   result.test_str_eq("label was set correctly", retrieved_label_string, label);
+
+   // set attribute
+   std::string new_label = "Botan test modified data object label";
+   const secure_vector<uint8_t> new_label_secvec(new_label.begin(), new_label.end());
+   data_obj.set_attribute_value(AttributeType::Label, new_label_secvec);
+
+   // get and check attribute
+   retrieved_label = data_obj.get_attribute_value(AttributeType::Label);
+   retrieved_label_string = std::string(retrieved_label.begin(), retrieved_label.end());
+   result.test_str_eq("label was modified correctly", retrieved_label_string, new_label);
+
+   data_obj.destroy();
+   return result;
+}
+
+Test::Result test_object_finder() {
+   Test::Result result("ObjectFinder");
+
+   const TestSession test_session(true);
+
+   // create object
+   const std::string label = "Botan test data object";
+   const auto data_obj_props = make_test_object(label);
+   const Object data_obj(test_session.session(), data_obj_props);
+
+   // search created object
+   AttributeContainer search_template;
+   search_template.add_string(AttributeType::Label, label);
+   ObjectFinder finder(test_session.session(), search_template.attributes());
+
+   auto search_result = finder.find();
+   result.test_sz_eq("one object found", search_result.size(), 1);
+   finder.finish();
+
+   const Object obj_found(test_session.session(), search_result.at(0));
+   result.test_bin_eq("found the object just created (same application)",
+                      obj_found.get_attribute_value(AttributeType::Application),
+                      data_obj.get_attribute_value(AttributeType::Application));
+
+   auto search_result2 = Object::search<Object>(test_session.session(), search_template.attributes());
+   result.test_bin_eq("found the object just created (same label)",
+                      obj_found.get_attribute_value(AttributeType::Label),
+                      search_result2.at(0).get_attribute_value(AttributeType::Label));
+
+   data_obj.destroy();
+   return result;
+}
+
+Test::Result test_object_copy() {
+   Test::Result result("Object copy");
+
+   const TestSession test_session(true);
+
+   // create object
+   const std::string label = "Botan test data object";
+   const auto data_obj_props = make_test_object(label);
+   const Object data_obj(test_session.session(), data_obj_props);
+
+   // copy created object
+   AttributeContainer copy_attributes;
+   copy_attributes.add_string(AttributeType::Label, "Botan test copied object");
+   const ObjectHandle copied_obj_handle = data_obj.copy(copy_attributes);
+
+   const ObjectFinder searcher(test_session.session(), copy_attributes.attributes());
+   const auto search_result = searcher.find();
+   result.test_sz_eq("one object found", search_result.size(), 1);
+
+   data_obj.destroy();
+
+   const Object copied_obj(test_session.session(), copied_obj_handle);
+   copied_obj.destroy();
+   return result;
+}
+   #endif
+
+class Object_Tests final : public Test {
+   public:
+      std::vector<Test::Result> run() override {
+         const std::vector<std::pair<std::string, std::function<Test::Result()>>> fns = {
+            {STRING_AND_FUNCTION(test_attribute_container)}
+   #if defined(BOTAN_HAS_ASN1)
+            ,
+            {STRING_AND_FUNCTION(test_create_destroy_data_object)},
+            {STRING_AND_FUNCTION(test_get_set_attribute_values)},
+            {STRING_AND_FUNCTION(test_object_finder)},
+            {STRING_AND_FUNCTION(test_object_copy)}
+   #endif
+         };
+
+         return run_pkcs11_tests("Object", fns);
+      }
+};
+
+BOTAN_REGISTER_SERIALIZED_TEST("pkcs11", "pkcs11-object", Object_Tests);
+
+/***************************** PKCS11 RSA *****************************/
+
+   #if defined(BOTAN_HAS_RSA)
+
+Test::Result test_rsa_privkey_import() {
+   Test::Result result("PKCS11 import RSA private key");
+
+   const TestSession test_session(true);
+
+   auto rng = Test::new_rng(__func__);
+
+   // create private key
+   const RSA_PrivateKey priv_key(*rng, 2048);
+   result.test_is_true("Key self test OK", priv_key.check_key(*rng, true));
+
+   // import to card
+   RSA_PrivateKeyImportProperties props(priv_key.get_n(), priv_key.get_d());
+   props.set_pub_exponent(priv_key.get_e());
+   props.set_prime_1(priv_key.get_p());
+   props.set_prime_2(priv_key.get_q());
+   props.set_coefficient(priv_key.get_c());
+   props.set_exponent_1(priv_key.get_d1());
+   props.set_exponent_2(priv_key.get_d2());
+
+   props.set_token(true);
+   props.set_private(true);
+   props.set_decrypt(true);
+   props.set_sign(true);
+
+   const PKCS11_RSA_PrivateKey pk(test_session.session(), props);
+   result.test_success("RSA private key import was successful");
+   result.test_is_true("PK self test OK", pk.check_key(*rng, true));
+
+   pk.destroy();
+   return result;
+}
+
+Test::Result test_rsa_privkey_export() {
+   Test::Result result("PKCS11 export RSA private key");
+
+   const TestSession test_session(true);
+
+   auto rng = Test::new_rng(__func__);
+
+   // create private key
+   const RSA_PrivateKey priv_key(*rng, 2048);
+
+   // import to card
+   RSA_PrivateKeyImportProperties props(priv_key.get_n(), priv_key.get_d());
+   props.set_pub_exponent(priv_key.get_e());
+   props.set_prime_1(priv_key.get_p());
+   props.set_prime_2(priv_key.get_q());
+   props.set_coefficient(priv_key.get_c());
+   props.set_exponent_1(priv_key.get_d1());
+   props.set_exponent_2(priv_key.get_d2());
+
+   props.set_token(true);
+   props.set_private(true);
+   props.set_decrypt(true);
+   props.set_sign(true);
+   props.set_extractable(true);
+   props.set_sensitive(false);
+
+   const PKCS11_RSA_PrivateKey pk(test_session.session(), props);
+   result.test_is_true("Check PK11 key", pk.check_key(*rng, true));
+
+   const RSA_PrivateKey exported = pk.export_key();
+   result.test_success("RSA private key export was successful");
+   result.test_is_true("Check exported key", exported.check_key(*rng, true));
+
+   pk.destroy();
+   return result;
+}
+
+Test::Result test_rsa_pubkey_import() {
+   Test::Result result("PKCS11 import RSA public key");
+
+   const TestSession test_session(true);
+
+   auto rng = Test::new_rng(__func__);
+
+   // create public key from private key
+   const RSA_PrivateKey priv_key(*rng, 2048);
+
+   // import to card
+   RSA_PublicKeyImportProperties props(priv_key.get_n(), priv_key.get_e());
+   props.set_token(true);
+   props.set_encrypt(true);
+   props.set_private(false);
+
+   const PKCS11_RSA_PublicKey pk(test_session.session(), props);
+   result.test_success("RSA public key import was successful");
+   result.test_is_true("Check PK11 key", pk.check_key(*rng, true));
+
+   pk.destroy();
+
+   return result;
+}
+
+Test::Result test_rsa_generate_private_key() {
+   Test::Result result("PKCS11 generate RSA private key");
+   const TestSession test_session(true);
+
+   RSA_PrivateKeyGenerationProperties props;
+   props.set_token(true);
+   props.set_private(true);
+   props.set_sign(true);
+   props.set_decrypt(true);
+
+   const PKCS11_RSA_PrivateKey pk(test_session.session(), 2048, props);
+   result.test_success("RSA private key generation was successful");
+
+   pk.destroy();
+
+   return result;
+}
+
+PKCS11_RSA_KeyPair generate_rsa_keypair(const TestSession& test_session) {
+   RSA_PublicKeyGenerationProperties pub_props(2048UL);
+   pub_props.set_pub_exponent();
+   pub_props.set_label("BOTAN_TEST_RSA_PUB_KEY");
+   pub_props.set_token(true);
+   pub_props.set_encrypt(true);
+   pub_props.set_verify(true);
+   pub_props.set_private(false);
+
+   RSA_PrivateKeyGenerationProperties priv_props;
+   priv_props.set_label("BOTAN_TEST_RSA_PRIV_KEY");
+   priv_props.set_token(true);
+   priv_props.set_private(true);
+   priv_props.set_sign(true);
+   priv_props.set_decrypt(true);
+
+   return PKCS11::generate_rsa_keypair(test_session.session(), pub_props, priv_props);
+}
+
+Test::Result test_rsa_generate_key_pair() {
+   Test::Result result("PKCS11 generate RSA key pair");
+   const TestSession test_session(true);
+
+   const PKCS11_RSA_KeyPair keypair = generate_rsa_keypair(test_session);
+   result.test_success("RSA key pair generation was successful");
+
+   keypair.first.destroy();
+   keypair.second.destroy();
+
+   return result;
+}
+
+Test::Result test_rsa_encrypt_decrypt() {
+   Test::Result result("PKCS11 RSA encrypt decrypt");
+   const TestSession test_session(true);
+
+   // generate key pair
+   PKCS11_RSA_KeyPair keypair = generate_rsa_keypair(test_session);
+
+   auto rng = Test::new_rng(__func__);
+
+   const auto encrypt_and_decrypt =
+      [&](const std::vector<uint8_t>& plaintext, const std::string& padding, const bool blinding) {
+         std::vector<uint8_t> encrypted;
+
+         try {
+            const Botan::PK_Encryptor_EME encryptor(keypair.first, *rng, padding);
+            encrypted = encryptor.encrypt(plaintext, *rng);
+            result.test_sz_lte(
+               "ciphertext length estimate", encrypted.size(), encryptor.ciphertext_length(plaintext.size()));
+         } catch(Botan::PKCS11::PKCS11_ReturnError& e) {
+            result.test_failure("PKCS11 RSA encrypt " + padding, e.what());
+         }
+
+         Botan::secure_vector<uint8_t> decrypted;
+
+         try {
+            keypair.second.set_use_software_padding(blinding);
+            const Botan::PK_Decryptor_EME decryptor(keypair.second, *rng, padding);
+            decrypted = decryptor.decrypt(encrypted);
+
+            result.test_sz_lte(
+               "plaintext length estimate", decrypted.size(), decryptor.plaintext_length(encrypted.size()));
+            result.test_sz_lte(
+               "ciphertext length estimate", encrypted.size(), decryptor.ciphertext_length(decrypted.size()));
+         } catch(Botan::PKCS11::PKCS11_ReturnError& e) {
+            std::ostringstream err;
+            err << "PKCS11 RSA decrypt " << padding;
+            if(blinding) {
+               err << " with userspace blinding";
+            }
+
+            result.test_failure(err.str(), e.what());
+         }
+
+         result.test_bin_eq("RSA PKCS11 encrypt and decrypt: " + padding, decrypted, plaintext);
+      };
+
+   std::vector<uint8_t> plaintext(256);
+   std::iota(std::begin(plaintext), std::end(plaintext), static_cast<uint8_t>(0));
+   encrypt_and_decrypt(plaintext, "Raw", false);
+
+   plaintext = {0x00, 0x01, 0x02, 0x03, 0x04, 0x00};
+   encrypt_and_decrypt(plaintext, "EME-PKCS1-v1_5", false);
+   encrypt_and_decrypt(plaintext, "EME-PKCS1-v1_5", true);
+
+   encrypt_and_decrypt(plaintext, "OAEP(SHA-1)", false);
+   encrypt_and_decrypt(plaintext, "OAEP(SHA-1)", true);
+
+   /*
+   * A ciphertext whose leading byte is zero has the same integer value with
+   * that byte removed, but RFC 8017 requires the ciphertext be exactly k bytes
+   */
+   const auto test_short_ciphertext = [&](const std::string& padding) {
+      const Botan::RSA_PublicKey soft_pubkey(keypair.first.get_n(), keypair.first.get_e());
+      const Botan::PK_Encryptor_EME encryptor(soft_pubkey, *rng, padding);
+
+      std::vector<uint8_t> ctext;
+      for(size_t i = 0; i != 100000; ++i) {
+         ctext = encryptor.encrypt(plaintext, *rng);
+         if(ctext[0] == 0) {
+            break;
+         }
+      }
+
+      if(!result.test_u8_eq("found ciphertext with leading zero byte", ctext[0], 0)) {
+         return;
+      }
+
+      keypair.second.set_use_software_padding(true);
+      const Botan::PK_Decryptor_EME decryptor(keypair.second, *rng, padding);
+      result.test_bin_eq("full length ciphertext decrypts", decryptor.decrypt(ctext), plaintext);
+      result.test_throws("short ciphertext is rejected: " + padding,
+                         [&]() { decryptor.decrypt(std::span{ctext}.subspan(1)); });
+   };
+
+   test_short_ciphertext("EME-PKCS1-v1_5");
+   test_short_ciphertext("OAEP(SHA-1)");
+
+   keypair.first.destroy();
+   keypair.second.destroy();
+
+   return result;
+}
+
+Test::Result test_rsa_sign_verify() {
+   Test::Result result("PKCS11 RSA sign and verify");
+   const TestSession test_session(true);
+
+   // generate key pair
+   PKCS11_RSA_KeyPair keypair = generate_rsa_keypair(test_session);
+
+   auto rng = Test::new_rng(__func__);
+
+   std::vector<uint8_t> plaintext(256);
+   std::iota(std::begin(plaintext), std::end(plaintext), static_cast<uint8_t>(0));
+
+   const auto sign_and_verify = [&](const std::string& padding, bool multipart) {
+      Botan::PK_Signer signer(keypair.second, *rng, padding, Botan::Signature_Format::Standard);
+      Botan::PK_Verifier verifier(keypair.first, padding, Botan::Signature_Format::Standard);
+      const Botan::RSA_PublicKey soft_pubkey(keypair.first.get_n(), keypair.first.get_e());
+      Botan::PK_Verifier soft_verifier(soft_pubkey, padding, Botan::Signature_Format::Standard);
+
+      // Reuse the operations with different messages and switch between single
+      // and multiple part input to ensure both buffer and token state are reset.
+      auto message = plaintext;
+      for(const bool use_multipart : {multipart, !multipart, multipart}) {
+         message.back() ^= 0x80;
+         const auto first_part = std::span{message}.first(use_multipart ? message.size() / 2 : message.size());
+         const auto last_part = std::span{message}.subspan(first_part.size());
+
+         // Empty updates before, between, and after data must have no effect.
+         signer.update(std::span<const uint8_t>{});
+         signer.update(first_part);
+         signer.update(std::span<const uint8_t>{});
+         signer.update(last_part);
+         signer.update(std::span<const uint8_t>{});
+         const auto signature = signer.signature(*rng);
+
+         verifier.update(std::span<const uint8_t>{});
+         verifier.update(first_part);
+         verifier.update(std::span<const uint8_t>{});
+         verifier.update(last_part);
+         verifier.update(std::span<const uint8_t>{});
+         result.test_is_true("RSA PKCS11 sign and verify: " + padding, verifier.check_signature(signature));
+         result.test_is_true("RSA PKCS11 signature verifies in software: " + padding,
+                             soft_verifier.verify_message(message, signature));
+      }
+   };
+
+   // single-part sign
+   sign_and_verify("Raw", false);
+   sign_and_verify("PKCS1v15(SHA-256)", false);
+   sign_and_verify("PSS(SHA-256)", false);
+
+   // multi-part sign
+   sign_and_verify("PKCS1v15(SHA-256)", true);
+   sign_and_verify("PSS(SHA-256)", true);
+
+   // single part only mechanisms, with the input split over several updates
+   sign_and_verify("Raw", true);
+
+   // PSS AlgorithmIdentifier, checked by the software verifier
+   {
+      Botan::PK_Signer signer(keypair.second, *rng, "PSS(SHA-256)");
+      const auto alg_id = signer.algorithm_identifier();
+      result.test_is_true(
+         "PSS AlgorithmIdentifier",
+         alg_id == Botan::AlgorithmIdentifier("RSA/PSS", Botan::PSS_Params("SHA-256", 32).serialize()));
+
+      const auto signature = signer.sign_message(plaintext, *rng);
+      const Botan::RSA_PublicKey soft_pubkey(keypair.first.get_n(), keypair.first.get_e());
+      Botan::PK_Verifier verifier(soft_pubkey, alg_id);
+      result.test_is_true("PSS signature verifies using AlgorithmIdentifier",
+                          verifier.verify_message(plaintext, signature));
+   }
+
+   // abandoned multi-part operations must not leave the session unusable
+   {
+      Botan::PK_Signer abandoned(keypair.second, *rng, "PKCS1v15(SHA-256)");
+      abandoned.update(plaintext.data(), 16);
+      abandoned.update(plaintext.data() + 16, 16);
+   }
+   {
+      Botan::PK_Verifier abandoned(keypair.first, "PKCS1v15(SHA-256)");
+      abandoned.update(plaintext.data(), 16);
+      abandoned.update(plaintext.data() + 16, 16);
+   }
+   sign_and_verify("PKCS1v15(SHA-256)", true);
+
+   // empty message, both without any update and with an empty update
+   const auto sign_and_verify_empty = [&](const std::string& padding, bool empty_update) {
+      Botan::PK_Signer signer(keypair.second, *rng, padding, Botan::Signature_Format::Standard);
+      if(empty_update) {
+         signer.update(std::span<const uint8_t>{});
+      }
+      const auto signature = signer.signature(*rng);
+
+      Botan::PK_Verifier verifier(keypair.first, padding, Botan::Signature_Format::Standard);
+      if(empty_update) {
+         verifier.update(std::span<const uint8_t>{});
+      }
+      result.test_is_true("RSA PKCS11 sign and verify empty message: " + padding, verifier.check_signature(signature));
+   };
+
+   sign_and_verify_empty("PKCS1v15(SHA-256)", false);
+   sign_and_verify_empty("PKCS1v15(SHA-256)", true);
+   sign_and_verify_empty("PSS(SHA-256)", false);
+
+   keypair.first.destroy();
+   keypair.second.destroy();
+
+   return result;
+}
+
+class PKCS11_RSA_Tests final : public Test {
+   public:
+      std::vector<Test::Result> run() override {
+         const std::vector<std::pair<std::string, std::function<Test::Result()>>> fns = {
+            {STRING_AND_FUNCTION(test_rsa_privkey_import)},
+            {STRING_AND_FUNCTION(test_rsa_pubkey_import)},
+            {STRING_AND_FUNCTION(test_rsa_privkey_export)},
+            {STRING_AND_FUNCTION(test_rsa_generate_private_key)},
+            {STRING_AND_FUNCTION(test_rsa_generate_key_pair)},
+            {STRING_AND_FUNCTION(test_rsa_encrypt_decrypt)},
+            {STRING_AND_FUNCTION(test_rsa_sign_verify)}};
+
+         return run_pkcs11_tests("PKCS11 RSA", fns);
+      }
+};
+
+BOTAN_REGISTER_SERIALIZED_TEST("pkcs11", "pkcs11-rsa", PKCS11_RSA_Tests);
+   #endif
+
+/***************************** PKCS11 ECDSA *****************************/
+
+   #if defined(BOTAN_HAS_ECC_PUBLIC_KEY_CRYPTO)
+std::vector<uint8_t> encode_ec_point_in_octet_str(const Botan::EC_PublicKey& pk) {
+   std::vector<uint8_t> enc;
+   DER_Encoder(enc).encode(pk.public_ec_point().serialize_uncompressed(), ASN1_Type::OctetString);
+   return enc;
+}
+
+std::vector<uint8_t> unregistered_ec_params() {
+   // Negating P-256's generator gives valid parameters that do not match a
+   // registered group. Encode directly: constructing a group from its integer
+   // parameters would register it and hide bugs caused by separate DER decodes.
+   const auto group = EC_Group::from_name("secp256r1");
+   const auto generator = EC_AffinePoint::generator(group).negate().serialize_uncompressed();
+   std::vector<uint8_t> params;
+   DER_Encoder(params)
+      .start_sequence()
+      .encode(size_t(1))
+      .start_sequence()
+      .encode(OID({1, 2, 840, 10045, 1, 1}))
+      .encode(group.get_p())
+      .end_cons()
+      .start_sequence()
+      .encode(group.get_a().serialize(group.get_p_bytes()), ASN1_Type::OctetString)
+      .encode(group.get_b().serialize(group.get_p_bytes()), ASN1_Type::OctetString)
+      .end_cons()
+      .encode(generator, ASN1_Type::OctetString)
+      .encode(group.get_order())
+      .encode(group.get_cofactor())
+      .end_cons();
+   return params;
+}
+
+// OpenSSL 4 rejects explicit curve parameters unless built with
+// enable-ec_explicit_curves, which SoftHSM reports as CKR_GENERAL_ERROR
+template <typename KeyPair, typename GenFn>
+std::optional<KeyPair> generate_unregistered_curve_keypair(Test::Result& result, GenFn gen) {
+   try {
+      return gen();
+   } catch(PKCS11_ReturnError& e) {
+      if(e.get_return_value() != ReturnValue::GeneralError) {
+         throw;
+      }
+      result.test_note("Skipping test; token rejected explicit curve parameters");
+      return std::nullopt;
+   }
+}
+
+void check_ec_private_key_public_point(Test::Result& result,
+                                       const PKCS11_EC_PrivateKey& key,
+                                       RandomNumberGenerator& rng) {
+   // Serializing a point alone cannot detect a mismatched group instance.
+   // Exercise the software public key with a scalar from its own domain.
+   const auto public_key = key.public_key();
+   const auto& ec_public = dynamic_cast<const EC_PublicKey&>(*public_key);
+   const auto point = ec_public.public_ec_point().mul(EC_Scalar::one(ec_public.domain()), rng);
+   result.test_bin_eq("public point belongs to the private key's domain",
+                      point.serialize_uncompressed(),
+                      key.public_ec_point().serialize_uncompressed());
+}
+   #endif
+
+   #if defined(BOTAN_HAS_ECDSA)
+
+Test::Result test_ecdsa_privkey_import() {
+   Test::Result result("PKCS11 import ECDSA private key");
+
+   const TestSession test_session(true);
+
+   auto rng = Test::new_rng(__func__);
+
+   // create ecdsa private key
+   const ECDSA_PrivateKey priv_key(*rng, EC_Group::from_name("secp256r1"));
+   result.test_is_true("Key self test OK", priv_key.check_key(*rng, true));
+
+   // import to card
+   EC_PrivateKeyImportProperties props(priv_key.DER_domain(), priv_key.private_value());
+   props.set_token(true);
+   props.set_private(true);
+   props.set_sign(true);
+
+   // label
+   const std::string label = "Botan test ecdsa key";
+   props.set_label(label);
+
+   PKCS11_ECDSA_PrivateKey pk(test_session.session(), props);
+   result.test_success("ECDSA private key import was successful");
+   pk.set_public_point(priv_key.public_ec_point());
+   result.test_is_true("P11 key self test OK", pk.check_key(*rng, false));
+
+   pk.destroy();
+   return result;
+}
+
+Test::Result test_ecdsa_privkey_export() {
+   Test::Result result("PKCS11 export ECDSA private key");
+
+   const TestSession test_session(true);
+
+   auto rng = Test::new_rng(__func__);
+
+   // create private key
+   const ECDSA_PrivateKey priv_key(*rng, EC_Group::from_name("secp256r1"));
+
+   result.test_is_true("Check ECDSA key", priv_key.check_key(*rng, true));
+   // import to card
+   EC_PrivateKeyImportProperties props(priv_key.DER_domain(), priv_key.private_value());
+   props.set_token(true);
+   props.set_private(true);
+   props.set_sign(true);
+   props.set_extractable(true);
+
+   // label
+   const std::string label = "Botan test ecdsa key";
+   props.set_label(label);
+
+   PKCS11_ECDSA_PrivateKey pk(test_session.session(), props);
+   pk.set_public_point(priv_key.public_ec_point());
+   result.test_is_true("Check PK11 key", pk.check_key(*rng, false));
+
+   const ECDSA_PrivateKey exported = pk.export_key();
+   result.test_success("ECDSA private key export was successful");
+   result.test_is_true("Check exported key valid", exported.check_key(*rng, true));
+   result.test_bin_eq("Check exported key contents", exported.private_key_bits(), priv_key.private_key_bits());
+
+   pk.destroy();
+   return result;
+}
+
+Test::Result test_ecdsa_pubkey_import() {
+   Test::Result result("PKCS11 import ECDSA public key");
+
+   const TestSession test_session(true);
+
+   auto rng = Test::new_rng(__func__);
+
+   // create ecdsa private key
+   const ECDSA_PrivateKey priv_key(*rng, EC_Group::from_name("secp256r1"));
+
+   const auto enc_point = encode_ec_point_in_octet_str(priv_key);
+
+   // import to card
+   EC_PublicKeyImportProperties props(priv_key.DER_domain(), enc_point);
+   props.set_token(true);
+   props.set_verify(true);
+   props.set_private(false);
+
+   // label
+   const std::string label = "Botan test ecdsa pub key";
+   props.set_label(label);
+
+   const PKCS11_ECDSA_PublicKey pk(test_session.session(), props);
+   result.test_success("ECDSA public key import was successful");
+
+   pk.destroy();
+
+   // A point that fails to decode must not leave an object on the token
+   std::vector<uint8_t> bad_point(65);
+   bad_point[0] = 0x04;
+   std::vector<uint8_t> enc_bad_point;
+   DER_Encoder(enc_bad_point).encode(bad_point, ASN1_Type::OctetString);
+
+   EC_PublicKeyImportProperties bad_props(priv_key.DER_domain(), enc_bad_point);
+   bad_props.set_token(true);
+   bad_props.set_verify(true);
+   bad_props.set_private(false);
+   const std::string bad_label = "Botan test ecdsa invalid pub key";
+   bad_props.set_label(bad_label);
+
+   result.test_throws("invalid public key import fails",
+                      [&]() { const PKCS11_ECDSA_PublicKey bad(test_session.session(), bad_props); });
+   result.test_sz_eq(
+      "no object left after failed import", count_objects_with_label(test_session.session(), bad_label), 0);
+
+   return result;
+}
+
+Test::Result test_ecdsa_pubkey_export() {
+   Test::Result result("PKCS11 export ECDSA public key");
+
+   const TestSession test_session(true);
+
+   auto rng = Test::new_rng(__func__);
+
+   // create public key from private key
+   const ECDSA_PrivateKey priv_key(*rng, EC_Group::from_name("secp256r1"));
+
+   const auto enc_point = encode_ec_point_in_octet_str(priv_key);
+
+   // import to card
+   EC_PublicKeyImportProperties props(priv_key.DER_domain(), enc_point);
+   props.set_token(true);
+   props.set_verify(true);
+   props.set_private(false);
+
+   // label
+   const std::string label = "Botan test ecdsa pub key";
+   props.set_label(label);
+
+   const PKCS11_ECDSA_PublicKey pk(test_session.session(), props);
+
+   const ECDSA_PublicKey exported = pk.export_key();
+   result.test_success("ECDSA public key export was successful");
+
+   pk.destroy();
+
+   return result;
+}
+
+Test::Result test_ecdsa_generate_private_key() {
+   Test::Result result("PKCS11 generate ECDSA private key");
+   const TestSession test_session(true);
+
+   EC_PrivateKeyGenerationProperties props;
+   props.set_token(true);
+   props.set_private(true);
+   props.set_sign(true);
+
+   const PKCS11_ECDSA_PrivateKey pk(test_session.session(), EC_Group::from_name("secp256r1").DER_encode(), props);
+   result.test_success("ECDSA private key generation was successful");
+
+   pk.destroy();
+
+   return result;
+}
+
+PKCS11_ECDSA_KeyPair generate_ecdsa_keypair(const TestSession& test_session,
+                                            const std::string& curve,
+                                            EC_Group_Encoding enc) {
+   EC_PublicKeyGenerationProperties pub_props(EC_Group::from_name(curve).DER_encode(enc));
+   pub_props.set_label("BOTAN_TEST_ECDSA_PUB_KEY");
+   pub_props.set_token(true);
+   pub_props.set_verify(true);
+   pub_props.set_private(false);
+   pub_props.set_modifiable(true);
+
+   EC_PrivateKeyGenerationProperties priv_props;
+   priv_props.set_label("BOTAN_TEST_ECDSA_PRIV_KEY");
+   priv_props.set_token(true);
+   priv_props.set_private(true);
+   priv_props.set_sensitive(true);
+   priv_props.set_extractable(false);
+   priv_props.set_sign(true);
+   priv_props.set_modifiable(true);
+
+   return PKCS11::generate_ecdsa_keypair(test_session.session(), pub_props, priv_props);
+}
+
+Test::Result test_ecdsa_generate_keypair() {
+   Test::Result result("PKCS11 generate ECDSA key pair");
+   const TestSession test_session(true);
+   std::vector<std::string> curves;
+
+   curves.push_back("secp256r1");
+   curves.push_back("brainpool512r1");
+
+   for(const auto& curve : curves) {
+      const PKCS11_ECDSA_KeyPair keypair = generate_ecdsa_keypair(test_session, curve, EC_Group_Encoding::NamedCurve);
+
+      result.test_bin_eq("private key has the public key",
+                         keypair.second.public_key()->public_key_bits(),
+                         keypair.first.public_key_bits());
+
+      keypair.first.destroy();
+      keypair.second.destroy();
+   }
+   result.test_success("ECDSA key pair generation was successful");
+
+   return result;
+}
+
+Test::Result test_ecdsa_generate_unregistered_curve() {
+   Test::Result result("PKCS11 ECDSA key pair with unregistered curve");
+   if(!EC_Group::supports_application_specific_group()) {
+      result.test_note("Skipping test; application specific groups are not supported");
+      return result;
+   }
+
+   const TestSession test_session(true);
+   auto rng = Test::new_rng(__func__);
+   EC_PublicKeyGenerationProperties pub_props(unregistered_ec_params());
+   pub_props.set_verify(true);
+   EC_PrivateKeyGenerationProperties priv_props;
+   priv_props.set_sign(true);
+
+   const auto keypair = generate_unregistered_curve_keypair<PKCS11_ECDSA_KeyPair>(
+      result, [&] { return PKCS11::generate_ecdsa_keypair(test_session.session(), pub_props, priv_props); });
+   if(!keypair) {
+      return result;
+   }
+
+   result.test_is_true("group has no registered OID", keypair->second.domain().get_curve_oid().empty());
+   check_ec_private_key_public_point(result, keypair->second, *rng);
+
+   keypair->first.destroy();
+   keypair->second.destroy();
+   return result;
+}
+
+Test::Result test_ecdsa_sign_verify_core(EC_Group_Encoding enc, const std::string& test_name) {
+   Test::Result result(test_name);
+   const TestSession test_session(true);
+   std::vector<std::string> curves;
+
+   curves.push_back("secp256r1");
+   curves.push_back("brainpool512r1");
+
+   const Slot& slot = test_session.slot();
+   SlotInfo info = slot.get_slot_info();
+   const std::string manufacturer(reinterpret_cast<char*>(info.manufacturerID));
+
+   auto rng = Test::new_rng(__func__);
+
+   for(const auto& curve : curves) {
+      // generate key pair
+      PKCS11_ECDSA_KeyPair keypair = generate_ecdsa_keypair(test_session, curve, enc);
+
+      std::vector<uint8_t> plaintext(20, 0x01);
+
+      const auto sign_and_verify =
+         [&](const std::string& padding, const Botan::Signature_Format format, bool check_soft) {
+            Botan::PK_Signer signer(keypair.second, *rng, padding, format);
+            auto signature = signer.sign_message(plaintext, *rng);
+
+            Botan::PK_Verifier token_verifier(keypair.first, padding, format);
+            const bool ecdsa_ok = token_verifier.verify_message(plaintext, signature);
+
+            result.test_is_true("ECDSA PKCS11 sign and verify: " + padding, ecdsa_ok);
+
+            // test against software implementation if available
+            if(check_soft) {
+               Botan::PK_Verifier soft_verifier(keypair.first, padding, format);
+               const bool soft_ecdsa_ok = soft_verifier.verify_message(plaintext, signature);
+
+               result.test_is_true("ECDSA PKCS11 verify (in software): " + padding, soft_ecdsa_ok);
+            }
+         };
+
+      // SoftHSMv2 until now only supports "Raw"
+      if(manufacturer.find("SoftHSM project") == std::string::npos) {
+         sign_and_verify("SHA-256", Botan::Signature_Format::Standard, true);
+         sign_and_verify("SHA-256", Botan::Signature_Format::DerSequence, true);
+      }
+
+      #if defined(BOTAN_HAS_EMSA_RAW)
+      sign_and_verify("Raw", Botan::Signature_Format::Standard, true);
+      #else
+      sign_and_verify("Raw", Botan::Signature_Format::Standard, false);
+      #endif
+
+      // CKM_ECDSA is single part only, so input split over several updates must be buffered
+      {
+         Botan::PK_Signer signer(keypair.second, *rng, "Raw");
+         Botan::PK_Verifier verifier(keypair.first, "Raw");
+         // Reuse the same signer and verifier to ensure each buffered message
+         // is consumed exactly once, regardless of how it was split into parts.
+         auto message = plaintext;
+         for(const size_t first_size : {size_t(7), message.size(), size_t(5)}) {
+            message.back() ^= 0x80;
+            signer.update(std::span<const uint8_t>{});
+            signer.update(std::span{message}.first(first_size));
+            signer.update(std::span<const uint8_t>{});
+            signer.update(std::span{message}.subspan(first_size));
+            const auto signature = signer.signature(*rng);
+            result.test_sz_eq("ECDSA PKCS11 signature length", signature.size(), signer.signature_length());
+
+            verifier.update(std::span<const uint8_t>{});
+            verifier.update(std::span{message}.first(first_size));
+            verifier.update(std::span<const uint8_t>{});
+            verifier.update(std::span{message}.subspan(first_size));
+            result.test_is_true("ECDSA PKCS11 multi-update sign and verify: Raw", verifier.check_signature(signature));
+            result.test_is_true("ECDSA PKCS11 verify of single update: Raw",
+                                Botan::PK_Verifier(keypair.first, "Raw").verify_message(message, signature));
+         }
+      }
+
+      // Aliases accepted for the mechanism are reported under the canonical hash name
+      {
+         const Botan::PK_Signer signer(keypair.second, *rng, Botan::PK_Signature_Options().with_hash("EMSA1(SHA-256)"));
+         result.test_str_eq("ECDSA PKCS11 EMSA1 alias hash name", signer.hash_function(), "SHA-256");
+      }
+
+      keypair.first.destroy();
+      keypair.second.destroy();
+   }
+
+   return result;
+}
+
+Test::Result test_ecdsa_sign_verify() {
+   // pass the curve OID to the PKCS#11 library
+   return test_ecdsa_sign_verify_core(EC_Group_Encoding::NamedCurve, "PKCS11 ECDSA sign and verify");
+}
+
+Test::Result test_ecdsa_curve_import() {
+   // pass the curve parameters to the PKCS#11 library and perform sign/verify to test them
+   return test_ecdsa_sign_verify_core(EC_Group_Encoding::Explicit, "PKCS11 ECDSA sign and verify with imported curve");
+}
+
+      #if defined(BOTAN_HAS_RSA)
+Test::Result test_typed_key_search() {
+   Test::Result result("PKCS11 typed key search");
+   const TestSession test_session(true);
+
+   // RSA and EC keys share the same object classes
+   const PKCS11_RSA_KeyPair rsa_keypair = generate_rsa_keypair(test_session);
+   const PKCS11_ECDSA_KeyPair ecdsa_keypair =
+      generate_ecdsa_keypair(test_session, "secp256r1", EC_Group_Encoding::NamedCurve);
+
+   const auto check_search = [&]<typename T>(const std::string& what, ObjectHandle expected) {
+      try {
+         const auto found = Object::search<T>(test_session.session());
+         const bool contains_expected =
+            std::any_of(found.begin(), found.end(), [&](const auto& obj) { return obj.handle() == expected; });
+         result.test_is_true(what + " finds the key", contains_expected);
+      } catch(std::exception& e) {
+         result.test_failure(what, e.what());
+      }
+   };
+
+   check_search.operator()<PKCS11_RSA_PublicKey>("RSA public key search", rsa_keypair.first.handle());
+   check_search.operator()<PKCS11_RSA_PrivateKey>("RSA private key search", rsa_keypair.second.handle());
+   check_search.operator()<PKCS11_ECDSA_PublicKey>("ECDSA public key search", ecdsa_keypair.first.handle());
+   check_search.operator()<PKCS11_ECDSA_PrivateKey>("ECDSA private key search", ecdsa_keypair.second.handle());
+
+   rsa_keypair.first.destroy();
+   rsa_keypair.second.destroy();
+   ecdsa_keypair.first.destroy();
+   ecdsa_keypair.second.destroy();
+
+   return result;
+}
+      #endif
+
+class PKCS11_ECDSA_Tests final : public Test {
+   public:
+      std::vector<Test::Result> run() override {
+         const std::vector<std::pair<std::string, std::function<Test::Result()>>> fns = {
+            {STRING_AND_FUNCTION(test_ecdsa_privkey_import)},
+            {STRING_AND_FUNCTION(test_ecdsa_privkey_export)},
+            {STRING_AND_FUNCTION(test_ecdsa_pubkey_import)},
+            {STRING_AND_FUNCTION(test_ecdsa_pubkey_export)},
+            {STRING_AND_FUNCTION(test_ecdsa_generate_private_key)},
+            {STRING_AND_FUNCTION(test_ecdsa_generate_keypair)},
+            {STRING_AND_FUNCTION(test_ecdsa_generate_unregistered_curve)},
+            {STRING_AND_FUNCTION(test_ecdsa_sign_verify)},
+            {STRING_AND_FUNCTION(test_ecdsa_curve_import)},
+      #if defined(BOTAN_HAS_RSA)
+            {STRING_AND_FUNCTION(test_typed_key_search)},
+      #endif
+         };
+
+         return run_pkcs11_tests("PKCS11 ECDSA", fns);
+      }
+};
+
+BOTAN_REGISTER_SERIALIZED_TEST("pkcs11", "pkcs11-ecdsa", PKCS11_ECDSA_Tests);
+
+   #endif
+
+   #if defined(BOTAN_HAS_ECDH)
+
+/***************************** PKCS11 ECDH *****************************/
+
+Test::Result test_ecdh_privkey_import() {
+   Test::Result result("PKCS11 import ECDH private key");
+
+   const TestSession test_session(true);
+
+   auto rng = Test::new_rng(__func__);
+
+   // create ecdh private key
+   const ECDH_PrivateKey priv_key(*rng, EC_Group::from_name("secp256r1"));
+
+   // import to card
+   EC_PrivateKeyImportProperties props(priv_key.DER_domain(), priv_key.private_value());
+   props.set_token(true);
+   props.set_private(true);
+   props.set_derive(true);
+
+   // label
+   const std::string label = "Botan test ecdh key";
+   props.set_label(label);
+
+   const PKCS11_ECDH_PrivateKey pk(test_session.session(), props);
+   result.test_success("ECDH private key import was successful");
+
+   pk.destroy();
+   return result;
+}
+
+Test::Result test_ecdh_privkey_export() {
+   Test::Result result("PKCS11 export ECDH private key");
+
+   const TestSession test_session(true);
+
+   auto rng = Test::new_rng(__func__);
+
+   // create private key
+   const ECDH_PrivateKey priv_key(*rng, EC_Group::from_name("secp256r1"));
+
+   // import to card
+   EC_PrivateKeyImportProperties props(priv_key.DER_domain(), priv_key.private_value());
+   props.set_token(true);
+   props.set_private(true);
+   props.set_derive(true);
+   props.set_extractable(true);
+
+   // label
+   const std::string label = "Botan test ecdh key";
+   props.set_label(label);
+
+   const PKCS11_ECDH_PrivateKey pk(test_session.session(), props);
+
+   const ECDH_PrivateKey exported = pk.export_key();
+   result.test_success("ECDH private key export was successful");
+
+   pk.destroy();
+   return result;
+}
+
+Test::Result test_ecdh_pubkey_import() {
+   Test::Result result("PKCS11 import ECDH public key");
+
+   const TestSession test_session(true);
+
+   auto rng = Test::new_rng(__func__);
+
+   // create ECDH private key
+   const ECDH_PrivateKey priv_key(*rng, EC_Group::from_name("secp256r1"));
+
+   const auto enc_point = encode_ec_point_in_octet_str(priv_key);
+
+   // import to card
+   EC_PublicKeyImportProperties props(priv_key.DER_domain(), enc_point);
+   props.set_token(true);
+   props.set_private(false);
+   props.set_derive(true);
+
+   // label
+   const std::string label = "Botan test ECDH pub key";
+   props.set_label(label);
+
+   const PKCS11_ECDH_PublicKey pk(test_session.session(), props);
+   result.test_success("ECDH public key import was successful");
+
+   pk.destroy();
+   return result;
+}
+
+Test::Result test_ecdh_pubkey_export() {
+   Test::Result result("PKCS11 export ECDH public key");
+
+   const TestSession test_session(true);
+
+   auto rng = Test::new_rng(__func__);
+
+   // create public key from private key
+   const ECDH_PrivateKey priv_key(*rng, EC_Group::from_name("secp256r1"));
+
+   const auto enc_point = encode_ec_point_in_octet_str(priv_key);
+
+   // import to card
+   EC_PublicKeyImportProperties props(priv_key.DER_domain(), enc_point);
+   props.set_token(true);
+   props.set_derive(true);
+   props.set_private(false);
+
+   // label
+   const std::string label = "Botan test ECDH pub key";
+   props.set_label(label);
+
+   const PKCS11_ECDH_PublicKey pk(test_session.session(), props);
+
+   const ECDH_PublicKey exported = pk.export_key();
+   result.test_success("ECDH public key export was successful");
+
+   pk.destroy();
+
+   return result;
+}
+
+Test::Result test_ecdh_generate_private_key() {
+   Test::Result result("PKCS11 generate ECDH private key");
+   const TestSession test_session(true);
+
+   EC_PrivateKeyGenerationProperties props;
+   props.set_token(true);
+   props.set_private(true);
+   props.set_derive(true);
+
+   const PKCS11_ECDH_PrivateKey pk(test_session.session(), EC_Group::from_name("secp256r1").DER_encode(), props);
+   result.test_success("ECDH private key generation was successful");
+
+   pk.destroy();
+
+   return result;
+}
+
+PKCS11_ECDH_KeyPair generate_ecdh_keypair(const TestSession& test_session, const std::string& label) {
+   EC_PublicKeyGenerationProperties pub_props(EC_Group::from_name("secp256r1").DER_encode());
+   pub_props.set_label(label + "_PUB_KEY");
+   pub_props.set_token(true);
+   pub_props.set_derive(true);
+   pub_props.set_private(false);
+   pub_props.set_modifiable(true);
+
+   EC_PrivateKeyGenerationProperties priv_props;
+   priv_props.set_label(label + "_PRIV_KEY");
+   priv_props.set_token(true);
+   priv_props.set_private(true);
+   priv_props.set_sensitive(true);
+   priv_props.set_extractable(false);
+   priv_props.set_derive(true);
+   priv_props.set_modifiable(true);
+
+   return PKCS11::generate_ecdh_keypair(test_session.session(), pub_props, priv_props);
+}
+
+Test::Result test_ecdh_generate_keypair() {
+   Test::Result result("PKCS11 generate ECDH key pair");
+   const TestSession test_session(true);
+
+   const PKCS11_ECDH_KeyPair keypair = generate_ecdh_keypair(test_session, "Botan test ECDH key1");
+   result.test_success("ECDH key pair generation was successful");
+
+   result.test_bin_eq(
+      "private key has the public value", keypair.second.public_value(), keypair.first.raw_public_key_bits());
+   result.test_bin_eq(
+      "raw_public_key_bits matches public_value", keypair.second.raw_public_key_bits(), keypair.second.public_value());
+   result.test_bin_eq("private key has the public key",
+                      keypair.second.public_key()->public_key_bits(),
+                      keypair.first.public_key_bits());
+
+   keypair.first.destroy();
+   keypair.second.destroy();
+
+   return result;
+}
+
+Test::Result test_ecdh_generate_unregistered_curve() {
+   Test::Result result("PKCS11 ECDH key pair with unregistered curve");
+   if(!EC_Group::supports_application_specific_group()) {
+      result.test_note("Skipping test; application specific groups are not supported");
+      return result;
+   }
+
+   const TestSession test_session(true);
+   auto rng = Test::new_rng(__func__);
+   EC_PublicKeyGenerationProperties pub_props(unregistered_ec_params());
+   pub_props.set_derive(true);
+   EC_PrivateKeyGenerationProperties priv_props;
+   priv_props.set_derive(true);
+
+   const auto keypair = generate_unregistered_curve_keypair<PKCS11_ECDH_KeyPair>(
+      result, [&] { return PKCS11::generate_ecdh_keypair(test_session.session(), pub_props, priv_props); });
+   if(!keypair) {
+      return result;
+   }
+
+   result.test_is_true("group has no registered OID", keypair->second.domain().get_curve_oid().empty());
+   check_ec_private_key_public_point(result, keypair->second, *rng);
+
+   keypair->first.destroy();
+   keypair->second.destroy();
+   return result;
+}
+
+Test::Result test_ecdh_derive() {
+   Test::Result result("PKCS11 ECDH derive");
+   const TestSession test_session(true);
+
+   const PKCS11_ECDH_KeyPair keypair = generate_ecdh_keypair(test_session, "Botan test ECDH key1");
+   const PKCS11_ECDH_KeyPair keypair2 = generate_ecdh_keypair(test_session, "Botan test ECDH key2");
+
+   auto rng = Test::new_rng(__func__);
+
+   // SoftHSMv2 only supports CKD_NULL KDF at the moment
+   const Botan::PK_Key_Agreement ka(keypair.second, *rng, "Raw");
+   const Botan::PK_Key_Agreement kb(keypair2.second, *rng, "Raw");
+
+   const Botan::SymmetricKey alice_key = ka.derive_key(32, keypair2.first.raw_public_key_bits());
+   const Botan::SymmetricKey bob_key = kb.derive_key(32, keypair.first.raw_public_key_bits());
+
+   const bool eq = alice_key == bob_key;
+   result.test_is_true("same secret key derived", eq);
+
+   keypair.first.destroy();
+   keypair.second.destroy();
+   keypair2.first.destroy();
+   keypair2.second.destroy();
+
+   return result;
+}
+
+Test::Result test_ecdh_cofactor_group() {
+   Test::Result result("PKCS11 ECDH with cofactor group");
+
+   if(!EC_Group::supports_application_specific_group_with_cofactor()) {
+      result.test_note("Skipping test; groups with a cofactor are not supported");
+      return result;
+   }
+
+   const TestSession test_session(true);
+   auto rng = Test::new_rng(__func__);
+
+   // secp128r2, which has cofactor 4
+   const EC_Group group(BigInt::from_string("0xFFFFFFFDFFFFFFFFFFFFFFFFFFFFFFFF"),
+                        BigInt::from_string("0xD6031998D1B3BBFEBF59CC9BBFF9AEE1"),
+                        BigInt::from_string("0x5EEEFCA380D02919DC2C6558BB6D8A5D"),
+                        BigInt::from_string("0x7B6AA5D85E572983E6FB32A7CDEBC140"),
+                        BigInt::from_string("0x27B6916A894D3AEE7106FE805FC34B44"),
+                        BigInt::from_string("0x3FFFFFFF7FFFFFFFBE0024720613B5A3"),
+                        BigInt::from_word(4));
+
+   const ECDH_PrivateKey priv_key(*rng, group);
+   EC_PrivateKeyImportProperties props(group.DER_encode(EC_Group_Encoding::Explicit), priv_key.private_value());
+   props.set_token(false);
+   props.set_private(true);
+   props.set_derive(true);
+
+   const PKCS11_ECDH_PrivateKey pk(test_session.session(), props);
+   const Botan::PK_Key_Agreement ka(pk, *rng, "Raw");
+
+   // A peer point in the prime order subgroup agrees with software ECDH
+   const ECDH_PrivateKey peer_key(*rng, group);
+   const Botan::PK_Key_Agreement peer_ka(peer_key, *rng, "Raw");
+   result.test_bin_eq("agreement with software ECDH",
+                      ka.derive_key(0, peer_key.public_value()).bits_of(),
+                      peer_ka.derive_key(0, priv_key.public_value()).bits_of());
+
+   // (x, 0) where x is a root of x^3 + ax + b is a point of order 2
+   std::vector<uint8_t> small_order_point(1 + 2 * 16);
+   small_order_point[0] = 0x04;
+   BigInt::from_string("0xEA1E91CC9229E872D1E910CE3EDCB319").serialize_to(std::span{small_order_point}.subspan(1, 16));
+
+   result.test_throws<Botan::Decoding_Error>("small order point is rejected",
+                                             [&]() { ka.derive_key(0, small_order_point); });
+
+   pk.destroy();
+
+   return result;
+}
+
+class PKCS11_ECDH_Tests final : public Test {
+   public:
+      std::vector<Test::Result> run() override {
+         const std::vector<std::pair<std::string, std::function<Test::Result()>>> fns = {
+            {STRING_AND_FUNCTION(test_ecdh_privkey_import)},
+            {STRING_AND_FUNCTION(test_ecdh_privkey_export)},
+            {STRING_AND_FUNCTION(test_ecdh_pubkey_import)},
+            {STRING_AND_FUNCTION(test_ecdh_pubkey_export)},
+            {STRING_AND_FUNCTION(test_ecdh_generate_private_key)},
+            {STRING_AND_FUNCTION(test_ecdh_generate_keypair)},
+            {STRING_AND_FUNCTION(test_ecdh_generate_unregistered_curve)},
+            {STRING_AND_FUNCTION(test_ecdh_derive)},
+            {STRING_AND_FUNCTION(test_ecdh_cofactor_group)}};
+
+         return run_pkcs11_tests("PKCS11 ECDH", fns);
+      }
+};
+
+BOTAN_REGISTER_SERIALIZED_TEST("pkcs11", "pkcs11-ecdh", PKCS11_ECDH_Tests);
+
+   #endif
+
+/***************************** PKCS11 RNG *****************************/
+
+Test::Result test_rng_generate_random() {
+   Test::Result result("PKCS11 RNG generate random");
+   const TestSession test_session(true);
+
+   PKCS11_RNG p11_rng(test_session.session());
+   result.test_is_true("RNG already seeded", p11_rng.is_seeded());
+
+   std::vector<uint8_t> random(20);
+   p11_rng.randomize(random.data(), random.size());
+   result.test_bin_ne("random data generated", random, std::vector<uint8_t>(20));
+
+   return result;
+}
+
+Test::Result test_rng_add_entropy() {
+   Test::Result result("PKCS11 RNG add entropy random");
+   const TestSession test_session(true);
+
+   PKCS11_RNG p11_rng(test_session.session());
+
+   result.test_is_true("RNG already seeded", p11_rng.is_seeded());
+   p11_rng.clear();
+   result.test_is_true("RNG ignores call to clear", p11_rng.is_seeded());
+
+   #if defined(BOTAN_HAS_ENTROPY_SOURCE)
+   result.test_sz_eq(
+      "RNG ignores calls to reseed", p11_rng.reseed_from_sources(Botan::Entropy_Sources::global_sources(), 256), 0);
+   #endif
+
+   auto rng = Test::new_rng(__func__);
+   auto random = rng->random_vec(20);
+   p11_rng.add_entropy(random.data(), random.size());
+   result.test_success("entropy added");
+
+   return result;
+}
+
+   #if defined(BOTAN_HAS_HMAC_DRBG) && defined(BOTAN_HAS_SHA2_64)
+
+Test::Result test_pkcs11_hmac_drbg() {
+   Test::Result result("PKCS11 HMAC_DRBG using PKCS11_RNG");
+   const TestSession test_session(true);
+
+   PKCS11_RNG p11_rng(test_session.session());
+   HMAC_DRBG drbg(MessageAuthenticationCode::create("HMAC(SHA-512)"), p11_rng);
+   // result.test_success("HMAC_DRBG(HMAC(SHA512)) instantiated with PKCS11_RNG");
+
+   result.test_is_false("HMAC_DRBG is not seeded yet.", drbg.is_seeded());
+   const secure_vector<uint8_t> rnd = drbg.random_vec(64);
+   result.test_is_true("HMAC_DRBG is seeded now", drbg.is_seeded());
+
+   std::string personalization_string = "Botan PKCS#11 Tests";
+   std::vector<uint8_t> personalization_data(personalization_string.begin(), personalization_string.end());
+   drbg.add_entropy(personalization_data.data(), personalization_data.size());
+
+   auto rnd_vec = drbg.random_vec(256);
+   result.test_bin_ne("HMAC_DRBG generated a random vector", rnd_vec, std::vector<uint8_t>(256));
+
+   return result;
+}
+   #endif
+
+class PKCS11_RNG_Tests final : public Test {
+   public:
+      std::vector<Test::Result> run() override {
+         const std::vector<std::pair<std::string, std::function<Test::Result()>>> fns = {
+   #if defined(BOTAN_HAS_HMAC_DRBG) && defined(BOTAN_HAS_SHA2_64)
+            {STRING_AND_FUNCTION(test_pkcs11_hmac_drbg)},
+   #endif
+            {STRING_AND_FUNCTION(test_rng_generate_random)},
+            {STRING_AND_FUNCTION(test_rng_add_entropy)}
+         };
+
+         return run_pkcs11_tests("PKCS11 RNG", fns);
+      }
+};
+
+BOTAN_REGISTER_SERIALIZED_TEST("pkcs11", "pkcs11-rng", PKCS11_RNG_Tests);
+
+/***************************** PKCS11 token management *****************************/
+
+Test::Result test_set_pin() {
+   Test::Result result("PKCS11 set pin");
+
+   Module module(Test::pkcs11_lib());
+   std::vector<SlotId> slot_vec = Slot::get_available_slots(module, true);
+   Slot slot(module, slot_vec.at(0));
+
+   PKCS11::set_pin(slot, SO_PIN(), TEST_PIN());
+   result.test_success("PIN set with SO_PIN to TEST_PIN");
+
+   PKCS11::set_pin(slot, SO_PIN(), PIN());
+   result.test_success("PIN changed back with SO_PIN");
+
+   return result;
+}
+
+Test::Result test_initialize() {
+   Test::Result result("PKCS11 initialize token");
+
+   Module module(Test::pkcs11_lib());
+   std::vector<SlotId> slot_vec = Slot::get_available_slots(module, true);
+   Slot slot(module, slot_vec.at(0));
+
+   PKCS11::initialize_token(slot, "Botan PKCS#11 tests", SO_PIN(), PIN());
+   result.test_success("token initialized");
+
+   return result;
+}
+
+Test::Result test_change_pin() {
+   Test::Result result("PKCS11 change pin");
+
+   Module module(Test::pkcs11_lib());
+   std::vector<SlotId> slot_vec = Slot::get_available_slots(module, true);
+   Slot slot(module, slot_vec.at(0));
+
+   PKCS11::change_pin(slot, PIN(), TEST_PIN());
+   result.test_success("PIN changed with PIN to TEST_PIN");
+
+   PKCS11::change_pin(slot, TEST_PIN(), PIN());
+   result.test_success("PIN changed back with TEST_PIN to PIN");
+
+   return result;
+}
+
+Test::Result test_change_so_pin() {
+   Test::Result result("PKCS11 change so_pin");
+
+   Module module(Test::pkcs11_lib());
+   std::vector<SlotId> slot_vec = Slot::get_available_slots(module, true);
+   Slot slot(module, slot_vec.at(0));
+
+   PKCS11::change_so_pin(slot, SO_PIN(), TEST_SO_PIN());
+   result.test_success("SO_PIN changed with SO_PIN to TEST_SO_PIN");
+
+   PKCS11::change_so_pin(slot, TEST_SO_PIN(), SO_PIN());
+   result.test_success("SO_PIN changed back with TEST_SO_PIN to SO_PIN");
+
+   return result;
+}
+
+class PKCS11_Token_Management_Tests final : public Test {
+   public:
+      std::vector<Test::Result> run() override {
+         const std::vector<std::pair<std::string, std::function<Test::Result()>>> fns = {
+            {STRING_AND_FUNCTION(test_set_pin)},
+            {STRING_AND_FUNCTION(test_initialize)},
+            {STRING_AND_FUNCTION(test_change_pin)},
+            {STRING_AND_FUNCTION(test_change_so_pin)}};
+
+         return run_pkcs11_tests("PKCS11 token management", fns);
+      }
+};
+
+BOTAN_REGISTER_SERIALIZED_TEST("pkcs11", "pkcs11-manage", PKCS11_Token_Management_Tests);
+
+/***************************** PKCS11 token management *****************************/
+
+   #if defined(BOTAN_HAS_X509_CERTIFICATES)
+
+Test::Result test_x509_import() {
+   Test::Result result("PKCS11 X509 cert import");
+
+      #if defined(BOTAN_TARGET_OS_HAS_FILESYSTEM)
+   const TestSession test_session(true);
+
+   const X509_Certificate root(Test::data_file("x509/nist/test01/end.crt"));
+   X509_CertificateProperties props(root);
+   props.set_label("Botan PKCS#11 test certificate");
+   props.set_private(false);
+   props.set_token(true);
+
+   const PKCS11_X509_Certificate pkcs11_cert(test_session.session(), props);
+   result.test_success("X509 certificate imported");
+
+   const PKCS11_X509_Certificate pkcs11_cert2(test_session.session(), pkcs11_cert.handle());
+   result.test_is_true("X509 certificate by handle", pkcs11_cert == pkcs11_cert2);
+
+   pkcs11_cert.destroy();
+
+   // A certificate that fails to parse must not leave an object on the token
+   const std::string bad_label = "Botan PKCS#11 test invalid certificate";
+   X509_CertificateProperties bad_props(root.raw_subject_dn(), std::vector<uint8_t>{0x30, 0x03, 0x02, 0x01, 0x00});
+   bad_props.set_label(bad_label);
+   bad_props.set_private(false);
+   bad_props.set_token(true);
+   result.test_throws("invalid certificate import fails",
+                      [&]() { const PKCS11_X509_Certificate cert(test_session.session(), bad_props); });
+   result.test_sz_eq(
+      "no object left after failed import", count_objects_with_label(test_session.session(), bad_label), 0);
+      #endif
+
+   return result;
+}
+
+class PKCS11_X509_Tests final : public Test {
+   public:
+      std::vector<Test::Result> run() override {
+         const std::vector<std::pair<std::string, std::function<Test::Result()>>> fns = {
+            {STRING_AND_FUNCTION(test_x509_import)}};
+
+         return run_pkcs11_tests("PKCS11 X509", fns);
+      }
+};
+
+BOTAN_REGISTER_SERIALIZED_TEST("pkcs11", "pkcs11-x509", PKCS11_X509_Tests);
+
+   #endif
+
+}  // namespace
+
+#endif
+
+}  // namespace Botan_Tests

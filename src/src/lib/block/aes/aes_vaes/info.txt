@@ -1,0 +1,18 @@
+<internal_defines>
+AES_VAES -> 20240803
+</internal_defines>
+
+<module_info>
+name -> "AES-VAES"
+brief -> "AES using VAES"
+</module_info>
+
+<requires>
+aes_hwaes
+cpuid
+simd_8x32
+</requires>
+
+<isa>
+vaes
+</isa>

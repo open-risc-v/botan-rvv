@@ -1,0 +1,473 @@
+/*
+* TPM 2.0 RSA Key Wrappres
+* (C) 2024 Jack Lloyd
+* (C) 2024 René Meusel, Amos Treiber - Rohde & Schwarz Cybersecurity GmbH, financed by LANCOM Systems GmbH
+*
+* Botan is released under the Simplified BSD License (see license.txt)
+*/
+
+#include <botan/tpm2_rsa.h>
+
+#include <botan/mem_ops.h>
+#include <botan/pk_options_readers.h>
+#include <botan/pss_params.h>
+#include <botan/rsa.h>
+#include <botan/internal/pk_options_impl.h>
+
+#include <botan/internal/ct_utils.h>
+#include <botan/internal/fmt.h>
+#include <botan/internal/sig_padding.h>
+#include <botan/internal/stl_util.h>
+#include <botan/internal/tpm2_algo_mappings.h>
+#include <botan/internal/tpm2_pkops.h>
+#include <botan/internal/tpm2_util.h>
+
+#include <tss2/tss2_esys.h>
+
+namespace Botan::TPM2 {
+
+RSA_PublicKey::RSA_PublicKey(Object handle, SessionBundle session_bundle, const TPM2B_PUBLIC* public_blob) :
+      Botan::TPM2::RSA_PublicKey(
+         std::move(handle), std::move(session_bundle), rsa_pubkey_components_from_tss2_public(public_blob)) {}
+
+RSA_PublicKey::RSA_PublicKey(Object handle, SessionBundle session_bundle, const std::pair<BigInt, BigInt>& pubkey) :
+      Botan::TPM2::PublicKey(std::move(handle), std::move(session_bundle)),
+
+      // TODO: move those BigInts as soon as the RSA c'tor allows it
+      Botan::RSA_PublicKey(pubkey.first, pubkey.second) {}
+
+RSA_PrivateKey::RSA_PrivateKey(Object handle,
+                               SessionBundle session_bundle,
+                               const TPM2B_PUBLIC* public_blob,
+                               std::span<const uint8_t> private_blob) :
+      Botan::TPM2::RSA_PrivateKey(std::move(handle),
+                                  std::move(session_bundle),
+                                  rsa_pubkey_components_from_tss2_public(public_blob),
+                                  private_blob) {}
+
+RSA_PrivateKey::RSA_PrivateKey(Object handle,
+                               SessionBundle session_bundle,
+                               const std::pair<BigInt, BigInt>& pubkey,
+                               std::span<const uint8_t> private_blob) :
+      Botan::TPM2::PrivateKey(std::move(handle), std::move(session_bundle), private_blob),
+
+      // TODO: move those BigInts as soon as the RSA c'tor allows it
+      Botan::RSA_PublicKey(pubkey.first, pubkey.second) {}
+
+std::unique_ptr<TPM2::PrivateKey> RSA_PrivateKey::create_unrestricted_transient(const std::shared_ptr<Context>& ctx,
+                                                                                const SessionBundle& sessions,
+                                                                                std::span<const uint8_t> auth_value,
+                                                                                const TPM2::PrivateKey& parent,
+                                                                                uint16_t keylength,
+                                                                                std::optional<uint32_t> exponent) {
+   BOTAN_ARG_CHECK(parent.is_parent(), "The passed key cannot be used as a parent key");
+
+   const TPM2B_SENSITIVE_CREATE sensitive_data = {
+      .size = 0,  // ignored
+      .sensitive =
+         {
+            .userAuth = copy_into<TPM2B_AUTH>(auth_value),
+
+            // Architecture Document, Section 25.2.3
+            //   When an asymmetric key is created, the caller is not allowed to
+            //   provide the sensitive data of the key.
+            .data = init_empty<TPM2B_SENSITIVE_DATA>(),
+         },
+   };
+
+   const TPMT_PUBLIC key_template = {
+      .type = TPM2_ALG_RSA,
+
+      // This is the algorithm for fingerprinting the newly created public key.
+      // For best compatibility we always use SHA-256.
+      .nameAlg = TPM2_ALG_SHA256,
+
+      // This sets up the key to be both a decryption and a signing key, forbids
+      // its duplication (fixed_tpm, fixed_parent) and ensures that the key's
+      // private portion can be used only by a user with an HMAC or password
+      // session.
+      .objectAttributes = ObjectAttributes::render({
+         .fixed_tpm = true,
+         .fixed_parent = true,
+         .sensitive_data_origin = true,
+         .user_with_auth = true,
+         .decrypt = true,
+         .sign_encrypt = true,
+      }),
+
+      // We currently do not support policy-based authorization
+      .authPolicy = init_empty<TPM2B_DIGEST>(),
+      .parameters =
+         {
+            .rsaDetail =
+               {
+                  // Structures Document (Part 2), Section 12.2.3.5
+                  //   If the key is not a restricted decryption key, this field
+                  //   shall be set to TPM_ALG_NULL.
+                  //
+                  // TODO: Once we stop supporting TSS < 4.0, we could use
+                  //       `.keyBits = {.null = {}}, .mode = {.null = {}}`
+                  //       which better reflects our intention here.
+                  .symmetric =
+                     {
+                        .algorithm = TPM2_ALG_NULL,
+                        .keyBits = {.sym = 0},
+                        .mode = {.sym = TPM2_ALG_NULL},
+                     },
+
+                  // Structures Document (Part 2), Section 12.2.3.5
+                  //   When both sign and decrypt are SET, restricted shall be
+                  //   CLEAR and scheme shall be TPM_ALG_NULL
+                  //
+                  // TODO: Once we stop supporting TSS < 4.0, we could use
+                  //       `.details = {.null = {}}`
+                  //       which better reflects our intention here.
+                  .scheme =
+                     {
+                        .scheme = TPM2_ALG_NULL,
+                        .details = {.anySig = {.hashAlg = TPM2_ALG_NULL}},
+                     },
+                  .keyBits = keylength,
+                  .exponent = exponent.value_or(0 /* default value - 2^16 + 1*/),
+               },
+         },
+
+      // For creating an asymmetric key this value is not used.
+      .unique = {.rsa = init_empty<TPM2B_PUBLIC_KEY_RSA>()},
+   };
+
+   return create_transient_from_template(
+      ctx, sessions, parent.handles().transient_handle(), key_template, sensitive_data);
+}
+
+namespace {
+
+SignatureAlgorithmSelection select_signature_algorithms(const PK_Signature_Options_Reader& options) {
+   if(!options.using_padding()) {
+      throw Not_Implemented("TPM2 RSA signing without padding is not supported");
+   }
+
+   if(!options.using_hash()) {
+      throw Invalid_Argument("RSA signing padding scheme must at least specify a hash function");
+   }
+
+   // The TPM chooses the PSS salt length itself, and PKCS#1 v1.5 has no salt
+   if(options.using_salt_size()) {
+      throw Not_Implemented("TPM2 RSA signing does not support specifying the salt size");
+   }
+
+   const std::string& hash_name = options.hash_function_name();
+   const std::string padding = fmt("{}({})", options.padding().value(), hash_name);
+
+   // PKCS#1 v1.5 is deterministic, while the TPM generates the PSS salt itself
+   if(options.using_deterministic_signature() && options.padding().value() != "PKCS1v15") {
+      throw Invalid_Argument(fmt("TPM2 RSA signing with {} cannot produce deterministic signatures", padding));
+   }
+
+   auto sig_scheme = rsa_signature_scheme_botan_to_tss2(padding);
+   if(!sig_scheme) {
+      throw Not_Implemented(Botan::fmt("RSA signing with padding scheme {}", padding));
+   }
+
+   return {
+      .signature_scheme = sig_scheme.value(),
+      .hash_name = hash_name,
+      .padding = padding,
+   };
+}
+
+size_t signature_length_for_rsa_key_handle(const SessionBundle& sessions, const Object& key_handle) {
+   return key_handle._public_info(sessions, TPM2_ALG_RSA).pub->publicArea.parameters.rsaDetail.keyBits / 8;
+}
+
+class RSA_Signature_Operation final : public Signature_Operation {
+   public:
+      RSA_Signature_Operation(const Object& object,
+                              const SessionBundle& sessions,
+                              const PK_Signature_Options_Reader& options) :
+            Signature_Operation(object, sessions, select_signature_algorithms(options)),
+            // This EMSA object actually isn't required, we just need it to
+            // conveniently figure out the padding name for the algorithm identifier
+            m_padding_name(SignaturePaddingScheme::create_or_throw(options)->name()) {}
+
+      size_t signature_length() const override { return signature_length_for_rsa_key_handle(sessions(), key_handle()); }
+
+      AlgorithmIdentifier algorithm_identifier() const override {
+         // TODO: This is essentially a copy of the ::algorithm_identifier()
+         //       in `rsa.h`. We should probably refactor this into a common
+         //       function.
+
+         // TODO: This is a hack, and we should clean this up.
+
+         try {
+            const std::string full_name = "RSA/" + m_padding_name;
+            const OID oid = OID::from_string(full_name);
+            return AlgorithmIdentifier(oid, AlgorithmIdentifier::USE_NULL_PARAM);
+         } catch(Lookup_Error&) {}
+
+         if(m_padding_name.starts_with("PSS(")) {
+            const auto parameters = PSS_Params::from_padding_name(m_padding_name).serialize();
+            return AlgorithmIdentifier("RSA/PSS", parameters);
+         }
+
+         throw Invalid_Argument(fmt("Signatures using RSA/{} are not supported", m_padding_name));
+      }
+
+   private:
+      std::vector<uint8_t> marshal_signature(const TPMT_SIGNATURE& signature) const override {
+         const auto& sig = [&] {
+            if(signature.sigAlg == TPM2_ALG_RSASSA) {
+               return signature.signature.rsassa;
+            } else if(signature.sigAlg == TPM2_ALG_RSAPSS) {
+               return signature.signature.rsapss;
+            }
+            throw Invalid_State(fmt("TPM2 returned an unexpected signature scheme {}", signature.sigAlg));
+         }();
+
+         BOTAN_ASSERT_NOMSG(sig.sig.size == signature_length());
+         return copy_into<std::vector<uint8_t>>(sig.sig);
+      }
+
+      std::string m_padding_name;
+};
+
+class RSA_Verification_Operation final : public Verification_Operation {
+   public:
+      RSA_Verification_Operation(const Object& object,
+                                 const SessionBundle& sessions,
+                                 const PK_Signature_Options_Reader& options) :
+            Verification_Operation(object, sessions, select_signature_algorithms(options)) {}
+
+   private:
+      TPMT_SIGNATURE unmarshal_signature(std::span<const uint8_t> signature) const override {
+         BOTAN_ARG_CHECK(signature.size() == signature_length_for_rsa_key_handle(sessions(), key_handle()),
+                         "Unexpected signature byte length");
+
+         TPMT_SIGNATURE sig;
+         sig.sigAlg = scheme().scheme;
+
+         auto& sig_data = [&]() -> TPMS_SIGNATURE_RSA& {
+            if(sig.sigAlg == TPM2_ALG_RSASSA) {
+               return sig.signature.rsassa;
+            } else if(sig.sigAlg == TPM2_ALG_RSAPSS) {
+               return sig.signature.rsapss;
+            }
+            throw Invalid_State(fmt("Requested an unexpected signature scheme {}", sig.sigAlg));
+         }();
+
+         sig_data.hash = scheme().details.any.hashAlg;
+         copy_into(sig_data.sig, signature);
+         return sig;
+      }
+};
+
+TPMT_RSA_DECRYPT select_encryption_algorithms(const PK_Encryption_Options_Reader& options) {
+   if(!options.using_padding()) {
+      throw Lookup_Error("TPM2 RSA encryption requires specifying a padding scheme");
+   }
+
+   std::string padding = options.padding().value();
+
+   if(padding == "OAEP") {
+      if(!options.using_hash()) {
+         throw Lookup_Error("TPM2 RSA OAEP requires specifying a hash function");
+      }
+      const std::string& hash_name = options.hash_function_name();
+
+      // The TPM always uses the OAEP hash for MGF1 as well
+      if(options.using_mgf1_hash() && options.mgf1_hash_function().value() != hash_name) {
+         throw Not_Implemented("TPM2 RSA OAEP does not support a distinct MGF1 hash function");
+      }
+
+      // TODO: support the OAEP label; note that the TPM includes a terminating
+      // null byte in the label it hashes, so this is not directly compatible
+      // with an RFC 8017 label of the same bytes
+
+      padding = fmt("OAEP({})", hash_name);
+   }
+
+   auto scheme = rsa_encryption_scheme_botan_to_tss2(padding);
+   if(!scheme) {
+      throw Not_Implemented(Botan::fmt("RSA encryption with padding scheme {}", padding));
+   }
+   return scheme.value();
+}
+
+class RSA_Encryption_Operation final : public PK_Ops::Encryption {
+   public:
+      RSA_Encryption_Operation(const Object& object,
+                               const SessionBundle& sessions,
+                               const PK_Encryption_Options_Reader& options) :
+            m_key_handle(object), m_sessions(sessions), m_scheme(select_encryption_algorithms(options)) {}
+
+      std::vector<uint8_t> encrypt(std::span<const uint8_t> msg, Botan::RandomNumberGenerator& /* rng */) override {
+         const auto plaintext = copy_into<TPM2B_PUBLIC_KEY_RSA>(msg);
+
+         // The OAEP label; see the TODO in select_encryption_algorithms
+         const auto label = init_empty<TPM2B_DATA>();
+
+         unique_esys_ptr<TPM2B_PUBLIC_KEY_RSA> ciphertext;
+         check_rc("Esys_RSA_Encrypt",
+                  Esys_RSA_Encrypt(m_key_handle.context()->esys_context(),
+                                   m_key_handle.transient_handle(),
+                                   m_sessions[0],
+                                   m_sessions[1],
+                                   m_sessions[2],
+                                   &plaintext,
+                                   &m_scheme,
+                                   &label,
+                                   out_ptr(ciphertext)));
+         BOTAN_ASSERT_NONNULL(ciphertext);
+         return copy_into<std::vector<uint8_t>>(*ciphertext);
+      }
+
+      // This duplicates quite a bit of domain knowledge about those RSA
+      // EMEs. And I'm quite certain that I screwed up somewhere.
+      //
+      // TODO: See if we can somehow share the logic with the software
+      //       RSA implementation and also PKCS#11 (which I believe is plain wrong).
+      size_t max_input_bits() const override {
+         const auto max_ptext_bytes =
+            (m_key_handle._public_info(m_sessions, TPM2_ALG_RSA).pub->publicArea.parameters.rsaDetail.keyBits - 1) / 8;
+         auto hash_output_bytes = [](TPM2_ALG_ID hash) -> size_t {
+            switch(hash) {
+               case TPM2_ALG_SHA1:
+                  return 160 / 8;
+               case TPM2_ALG_SHA256:
+               case TPM2_ALG_SHA3_256:
+                  return 256 / 8;
+               case TPM2_ALG_SHA384:
+               case TPM2_ALG_SHA3_384:
+                  return 384 / 8;
+               case TPM2_ALG_SHA512:
+               case TPM2_ALG_SHA3_512:
+                  return 512 / 8;
+               default:
+                  throw Invalid_State("Unexpected hash algorithm");
+            }
+         };
+
+         const auto max_input_bytes = [&]() -> size_t {
+            switch(m_scheme.scheme) {
+               case TPM2_ALG_RSAES:
+                  return max_ptext_bytes - 10;
+               case TPM2_ALG_OAEP:
+                  return max_ptext_bytes - 2 * hash_output_bytes(m_scheme.details.oaep.hashAlg) - 1;
+               case TPM2_ALG_NULL:
+                  return max_ptext_bytes;
+               default:
+                  throw Invalid_State("Unexpected RSA encryption scheme");
+            }
+         }();
+
+         return max_input_bytes * 8;
+      }
+
+      size_t ciphertext_length(size_t /* ptext_len */) const override {
+         return m_key_handle._public_info(m_sessions, TPM2_ALG_RSA).pub->publicArea.parameters.rsaDetail.keyBits - 1;
+      }
+
+   private:
+      const Object& m_key_handle;
+      const SessionBundle& m_sessions;
+      TPMT_RSA_DECRYPT m_scheme;
+};
+
+class RSA_Decryption_Operation final : public PK_Ops::Decryption {
+   public:
+      RSA_Decryption_Operation(const Object& object,
+                               const SessionBundle& sessions,
+                               const PK_Encryption_Options_Reader& options) :
+            m_key_handle(object), m_sessions(sessions), m_scheme(select_encryption_algorithms(options)) {}
+
+      size_t decrypt(uint8_t& valid_mask, std::span<uint8_t> ptext, std::span<const uint8_t> input) override {
+         const auto ciphertext = copy_into<TPM2B_PUBLIC_KEY_RSA>(input);
+         const auto label = init_empty<TPM2B_DATA>();  // see the TODO in select_encryption_algorithms
+         unique_esys_ptr<TPM2B_PUBLIC_KEY_RSA> plaintext;
+
+         // TODO: I'm not sure that TPM2_RC_FAILURE is the right error code for
+         //       all cases here. It passed the test (with a faulty ciphertext),
+         //       but I didn't find this to be clearly documented. :-(
+         //
+         // It seems the TPM2 simulator in Ubuntu 26.04 returns some other (otherwise
+         // undocumented?) value. Since this situation is clearly a bit ambiguous we now
+         // just accept any error as "decryption failed", somewhat unfortunate in that
+         // logical errors may become hidden but no clear resolution otherwise.
+         const auto rc = Esys_RSA_Decrypt(m_key_handle.context()->esys_context(),
+                                          m_key_handle.transient_handle(),
+                                          m_sessions[0],
+                                          m_sessions[1],
+                                          m_sessions[2],
+                                          &ciphertext,
+                                          &m_scheme,
+                                          &label,
+                                          out_ptr(plaintext));
+
+         const auto success = CT::Mask<TSS2_RC>::is_equal(rc, TPM2_RC_SUCCESS).as_choice();
+         valid_mask = CT::Mask<uint8_t>::from_choice(success).value();
+
+         // A "typical" payload size for RSA encryption, assuming that we usually
+         // encrypt some symmetric key of a hybrid encryption scheme.
+         constexpr size_t default_plaintext_length = 32;
+
+         // When Esys_RSA_Decrypt fails to decrypt the ciphertext (e.g. because
+         // of a PKCS#1.5 padding failure), the `plaintext` pointer will be nullptr.
+         // This behaviour in itself is likely exposing a timing side channel already.
+         // Nevertheless, we do our best to mitigate any oracles by always copying a
+         // dummy plaintext value in this case.
+         auto dummy_plaintext = init_with_size<TPM2B_PUBLIC_KEY_RSA>(default_plaintext_length);
+         auto* out = &dummy_plaintext;
+         auto* maybe_plaintext = plaintext.get();
+         CT::conditional_swap_ptr(success.as_bool(), out, maybe_plaintext);
+
+         BOTAN_ASSERT_NONNULL(out);
+         const auto decrypted = as_span(*out);
+         BOTAN_ARG_CHECK(ptext.size() >= decrypted.size(), "Output buffer too small for decryption");
+         copy_mem(ptext.first(decrypted.size()), decrypted);
+         return decrypted.size();
+      }
+
+      size_t plaintext_length(size_t /* ciphertext_length */) const override {
+         return m_key_handle._public_info(m_sessions, TPM2_ALG_RSA).pub->publicArea.parameters.rsaDetail.keyBits / 8;
+      }
+
+      size_t ciphertext_length(size_t /* ptext_len */) const override {
+         return m_key_handle._public_info(m_sessions, TPM2_ALG_RSA).pub->publicArea.parameters.rsaDetail.keyBits / 8;
+      }
+
+   private:
+      const Object& m_key_handle;
+      const SessionBundle& m_sessions;
+      TPMT_RSA_DECRYPT m_scheme;
+};
+
+}  // namespace
+
+std::unique_ptr<PK_Ops::Verification> RSA_PublicKey::_create_verification_op(
+   const PK_Signature_Options_Reader& options) const {
+   require_hardware_provider(options, algo_name(), "tpm2");
+   return std::make_unique<RSA_Verification_Operation>(handles(), sessions(), options);
+}
+
+std::unique_ptr<PK_Ops::Signature> RSA_PrivateKey::_create_signature_op(
+   Botan::RandomNumberGenerator& rng, const PK_Signature_Options_Reader& options) const {
+   BOTAN_UNUSED(rng);
+   require_hardware_provider(options, algo_name(), "tpm2");
+   return std::make_unique<RSA_Signature_Operation>(handles(), sessions(), options);
+}
+
+std::unique_ptr<PK_Ops::Encryption> RSA_PublicKey::_create_encryption_op(
+   Botan::RandomNumberGenerator& rng, const PK_Encryption_Options_Reader& options) const {
+   BOTAN_UNUSED(rng);
+   require_hardware_provider(options, algo_name(), "tpm2");
+   return std::make_unique<RSA_Encryption_Operation>(handles(), sessions(), options);
+}
+
+std::unique_ptr<PK_Ops::Decryption> RSA_PrivateKey::_create_decryption_op(
+   Botan::RandomNumberGenerator& rng, const PK_Encryption_Options_Reader& options) const {
+   BOTAN_UNUSED(rng);
+   require_hardware_provider(options, algo_name(), "tpm2");
+   return std::make_unique<RSA_Decryption_Operation>(handles(), sessions(), options);
+}
+
+}  // namespace Botan::TPM2

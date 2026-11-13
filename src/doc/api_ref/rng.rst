@@ -1,0 +1,412 @@
+.. _random_number_generators:
+
+Random Number Generators
+========================================
+
+.. cpp:class:: RandomNumberGenerator
+
+   The base class for all RNG objects, is declared in ``rng.h``.
+
+   .. cpp:function:: void randomize(uint8_t* output_array, size_t length)
+
+      Places *length* random bytes into the provided buffer.
+
+   .. cpp:function:: void randomize_with_input(uint8_t* data, size_t length, \
+                     const uint8_t* extra_input, size_t extra_input_len)
+
+      Like randomize, but first incorporates the additional input field into the
+      state of the RNG. The additional input could be anything which
+      parameterizes this request. Not all RNG types accept additional inputs,
+      the value will be silently ignored when not supported.
+
+      The additional input is never credited as entropy. Calling this function
+      with an empty output buffer mixes the input into the state of a stateful
+      RNG (such as ``HMAC_DRBG``) without affecting whether it is considered
+      seeded. This is the right way to opportunistically mix in data of unknown
+      quality, such as nonces or timestamps from a peer's protocol message.
+
+   .. cpp:function:: void randomize_with_ts_input(uint8_t* data, size_t length)
+
+      Creates a buffer with some unique values and calls ``randomize_with_input``
+
+      The buffer consists of an 8 byte timestamp, followed by 8 bytes from the
+      processor's hardware RNG if one is available and fast. The remainder of
+      the 22 byte buffer is filled from the system RNG if available, otherwise
+      from the processor's hardware RNG if one is available.
+
+   .. cpp:function:: uint8_t next_byte()
+
+      Generates a single random byte and returns it. Note that calling this
+      function several times is much slower than calling ``randomize`` once to
+      produce multiple bytes at a time.
+
+   .. cpp:function:: void add_entropy(const uint8_t* data, size_t length)
+
+      Provides seed material to the RNG, if at all possible. This works for most
+      RNG types, including the system and TPM RNGs. But if the RNG doesn't
+      support this operation, the data is dropped, no error is indicated.
+
+      The caller asserts that the data is full entropy seed material. A stateful
+      RNG such as ``HMAC_DRBG`` considers itself seeded once a single call
+      provides at least ``security_level()`` bits. To mix in data which should
+      not be credited use :cpp:func:`RandomNumberGenerator::randomize_with_input`
+      with an empty output buffer instead.
+
+   .. cpp:function:: bool accepts_input() const
+
+      This function returns ``false`` if it is known that this RNG object cannot
+      accept external inputs. In this case, any calls to
+      :cpp:func:`RandomNumberGenerator::add_entropy` will be ignored.
+
+   .. cpp:function:: void reseed_from_rng(RandomNumberGenerator& rng, \
+                     size_t poll_bits = BOTAN_RNG_RESEED_POLL_BITS)
+
+      Reseed by calling ``rng`` to acquire ``poll_bits`` data.
+
+
+RNG Types
+----------------------------------------
+
+Several different RNG types are implemented. Some access hardware RNGs, which
+are only available on certain platforms. Others are mostly useful in specific
+situations.
+
+Generally prefer using ``System_RNG``, or if not available use ``AutoSeeded_RNG``
+which is intended to provide best possible behavior in a userspace PRNG.
+
+System_RNG
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+On systems which support it, in ``system_rng.h`` you can access a shared
+reference to a process global instance of the system PRNG (using interfaces such
+as ``/dev/urandom``, ``getrandom``, ``arc4random``, ``BCryptGenRandom``,
+or ``RtlGenRandom``):
+
+.. cpp:function:: RandomNumberGenerator& system_rng()
+
+   Returns a reference to the system RNG
+
+There is also a wrapper class ``System_RNG`` which simply invokes on
+the return value of ``system_rng()``. This is useful in situations where
+you may sometimes want to use the system RNG and a userspace RNG in others,
+for example::
+
+  std::unique_ptr<Botan::RandomNumberGenerator> rng;
+  #if defined(BOTAN_HAS_SYSTEM_RNG)
+  rng.reset(new System_RNG);
+  #else
+  rng.reset(new AutoSeeded_RNG);
+  #endif
+
+Unlike nearly any other object in Botan it is acceptable to share a single
+instance of ``System_RNG`` between threads without locking, because the underlying
+RNG is itself thread safe due to being serialized by a mutex in the kernel itself.
+
+AutoSeeded_RNG
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+AutoSeeded_RNG is type naming a 'best available' userspace PRNG. The exact
+definition of this has changed over time and may change again in the future.
+
+.. note::
+
+   Starting in 2.16.0, AutoSeeded_RNG uses an internal lock and so is safe to
+   share among threads. However if possible it is still better to use a RNG per
+   thread as otherwise the RNG object needlessly creates a point of contention.
+   In previous versions, the RNG does not have an internal lock and all access
+   to it must be serialized.
+
+The current version uses HMAC_DRBG with either SHA-256 or SHA-512, with the
+choice made between which should be the faster hash on the currently running
+system.
+
+The initial seed is generated either by the system PRNG (if available) or a
+default set of entropy sources.  These are also used for periodic reseeding of
+the RNG state.
+
+HMAC_DRBG
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+HMAC-DRBG is a random number generator designed by NIST and specified
+in SP 800-90A. It seems to be the most conservative generator of the
+NIST approved options.
+
+It can be instantiated with any HMAC but is typically used with
+SHA-256, SHA-384, or SHA-512, as these are the hash functions approved
+for this use by NIST.
+
+HMAC-DRBG is implemented against the NIST SP800-90A specification, as
+stated above and provides stable output across botan releases regarding
+identical seeds (e.g. in KATs or unit tests).
+
+.. note::
+   There is no reason to use this class directly unless your application
+   requires HMAC-DRBG with specific parameters or options. Usually this
+   would be for some standards conformance reason. If you just want a
+   userspace RNG, use ``AutoSeeded_RNG``.
+
+``HMAC_DRBG``'s constructors are:
+
+.. cpp:class:: HMAC_DRBG
+
+      .. cpp:function:: HMAC_DRBG(std::unique_ptr<MessageAuthenticationCode> prf, \
+                        RandomNumberGenerator& underlying_rng, \
+                        size_t reseed_interval = BOTAN_RNG_DEFAULT_RESEED_INTERVAL, \
+                        size_t max_number_of_bytes_per_request = 64 * 1024)
+
+         Creates a DRBG which will automatically reseed as required by making
+         calls to ``underlying_rng`` either after being invoked
+         ``reseed_interval`` times, or if use of ``fork`` system call is
+         detected.
+
+         You can disable automatic reseeding by setting ``reseed_interval`` to
+         zero, in which case ``underlying_rng`` will only be invoked in the case
+         of ``fork``.
+
+         The specification of HMAC DRBG requires that each invocation produce no
+         more than 64 kibibytes of data. However, the RNG interface allows
+         producing arbitrary amounts of data in a single request. To accommodate
+         this, ``HMAC_DRBG`` treats requests for more data as if they were
+         multiple requests each of (at most) the maximum size. You can specify a
+         smaller maximum size with ``max_number_of_bytes_per_request``. There is
+         normally no reason to do this.
+
+      .. cpp:function:: HMAC_DRBG(std::unique_ptr<MessageAuthenticationCode> prf, \
+                        Entropy_Sources& entropy_sources, \
+                        size_t reseed_interval = BOTAN_RNG_DEFAULT_RESEED_INTERVAL, \
+                        size_t max_number_of_bytes_per_request = 64 * 1024)
+
+         Like above function, but instead of an RNG taking a set of entropy
+         sources to seed from as required.
+
+      .. cpp:function:: HMAC_DRBG(std::unique_ptr<MessageAuthenticationCode> prf, \
+                        RandomNumberGenerator& underlying_rng, \
+                        Entropy_Sources& entropy_sources, \
+                        size_t reseed_interval = BOTAN_RNG_DEFAULT_RESEED_INTERVAL, \
+                        size_t max_number_of_bytes_per_request = 64 * 1024)
+
+         Like above function, but taking both an RNG and a set of entropy
+         sources to seed from as required.
+
+      .. cpp:function:: HMAC_DRBG(std::unique_ptr<MessageAuthenticationCode> prf)
+
+         Creates an unseeded DRBG. You must explicitly provide seed data later
+         on in order to use this RNG. This is primarily useful for deterministic
+         key generation.
+
+         Since no source of data is available to automatically reseed, automatic
+         reseeding is disabled when this constructor is used. If the RNG object
+         detects that ``fork`` system call was used without it being
+         subsequently reseeded, it will throw an exception.
+
+      .. cpp:function:: HMAC_DRBG(const std::string& hmac_hash)
+
+         Like the constructor just taking a PRF, except instead of a PRF object,
+         a string specifying what hash to use with HMAC is provided.
+
+ChaCha_RNG
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+This is a very fast userspace PRNG based on ChaCha20 and HMAC(SHA-512). The key
+and IV for ChaCha are derived by hashing entropy inputs with HMAC. Then the ChaCha
+keystream generator is run, first to generate the new HMAC key (used for any
+future entropy additions), then the desired RNG outputs.
+
+Please note, that you should not rely on the stability of this RNG's outputs
+regarding identical seeds across versions. The output changed in version 3.14.0
+and will likely change again at any future time. Use ``HMAC_DRBG`` if this kind
+of stability should be necessary for your application scenario.
+
+This RNG composes two primitives thought to be secure (ChaCha and HMAC) in a
+simple and well studied way (the extract-then-expand paradigm), but is still an
+ad-hoc and non-standard construction. It is included because it is roughly 20x
+faster then HMAC_DRBG (basically running as fast as ChaCha can generate
+keystream bits), and certain applications need access to a very fast RNG.
+
+One thing applications using ``ChaCha_RNG`` need to be aware of is that for
+performance reasons, no backtracking resistance is enabled in the RNG by default.
+An attacker who recovers the ``ChaCha_RNG`` state can recover the output
+backwards in time to the last rekey and forwards to the next rekey under these
+circumstances. You can enable backtracking resistance by passing
+``ChaCha_RNG::KeyErasure::WithKeyErasure`` to the respective constructor of
+``ChaCha_RNG``. With this setting enabled, the ChaCha key gets overwritten after
+every generate request made to the RNG.
+
+An explicit reseeding (:cpp:func:`RandomNumberGenerator::add_entropy`) or
+providing any input to the RNG
+(:cpp:func:`RandomNumberGenerator::randomize_with_ts_input`,
+:cpp:func:`RandomNumberGenerator::randomize_with_input`) is sufficient to cause
+a rekey. Or, if a RNG or entropy source was provided to the ``ChaCha_RNG``
+constructor, then reseeding will be performed automatically after a certain
+interval of requests.
+
+Processor_RNG
+^^^^^^^^^^^^^^^^^
+
+This RNG type directly invokes a CPU instruction capable of generating
+a cryptographically secure random number. On x86 it uses ``rdrand``,
+on POWER ``darn``, and on AArch64 ``rndr``. If the relevant instruction
+is not available, the constructor of the class will throw at runtime.
+You can test beforehand by checking the result of
+``Processor_RNG::available()``.
+
+TPM_RNG & TPM2_RNG
+^^^^^^^^^^^^^^^^^^
+
+These RNG types allow using the RNG exported from a TPM chip.
+
+PKCS11_RNG
+^^^^^^^^^^^^^^^^^
+
+This RNG type allows using the RNG exported from a hardware token accessed via PKCS11.
+
+Jitter_RNG
+^^^^^^^^^^^^^^^^^
+
+This is an RNG based on low-level CPU timing jitter, using the
+`jitterentropy library <https://github.com/smuellerDD/jitterentropy-library>`_.
+
+Can be enabled with ``configure.py`` via ``--enable-modules="jitter_rng"``, provided
+you have the library installed and made available to the build, including headers.
+
+The constructor takes the compliance mode which should be requested from
+jitterentropy, as well as the oversampling rate:
+
+``Jitter_RNG::Mode::Default``
+   Leaves the library at its defaults. The SP800-90B health tests are then only
+   enforced if the system itself runs in FIPS mode.
+
+``Jitter_RNG::Mode::FIPS``
+   Forces full SP800-90B compliance including the online health tests
+   (``JENT_FORCE_FIPS``), independent of the state of the system.
+
+``Jitter_RNG::Mode::NTG1``
+   Requests AIS 20/31 NTG.1 compliance (``JENT_NTG1``). This implies FIPS mode
+   and additionally disables the internal timer of jitterentropy, so it is
+   unavailable on platforms without a usable high resolution timer. It requires
+   jitterentropy 3.7.0 or later, both at build and at run time; otherwise the
+   constructor throws ``Not_Implemented``. Use ``Jitter_RNG::ntg1_supported()``
+   to query this beforehand.
+
+The oversampling rate controls how many timing samples are collected per output
+bit. Higher values are more conservative but slower; the default of zero lets
+jitterentropy apply its own minimal rate. Rates the library rejects as out of
+range cause the constructor to throw.
+
+.. note::
+   Before 3.14.0, ``Jitter_RNG`` always requested ``JENT_FORCE_FIPS``. The
+   default is now ``Mode::Default``; pass ``Mode::FIPS`` explicitly to retain
+   the previous behavior.
+
+Entropy Sources
+---------------------------------
+
+An ``EntropySource`` is an abstract representation of some method of
+gather "real" entropy. This tends to be very system dependent. The
+*only* way you should use an ``EntropySource`` is to pass it to a PRNG
+that will extract entropy from it -- never use the output directly for
+any kind of key or nonce generation!
+
+``EntropySource`` has a single function which is called at runtime, ``gather``,
+which is passed an ``Entropy_Accumulator``. The source performs its polling and
+contributes whatever it gathers to the accumulator using ``add``. The second
+parameter to ``add`` is a conservative estimate of the number of bits of entropy
+that data contains. The estimate can be zero, if the data should be used but not
+counted. A source which gathers many small samples, each worth less than a bit,
+should batch several samples and credit the batch with a conservatively rounded
+estimate. The accumulator's ``goal_reached`` function tells a source when it may
+stop early.
+
+The RNG which initiated the poll considers itself seeded once the total reaches
+its security level. Estimates are summed over the poll, and if sufficient data
+is available in that poll then the RNG is considered seeded. A failed/incomplete
+poll on an unseeded RNG leaves it in an unseeded state; entropy estimates do not
+carry over between polls.
+
+.. versionadded:: 3.14.0
+   ``gather`` and ``Entropy_Accumulator``. Sources implementing the previous
+   interface, ``size_t poll(RandomNumberGenerator&)``, continue to work: the
+   data they provide via ``add_entropy`` is contributed uncounted, and the
+   estimate they return is credited for the poll as a whole.
+
+   The ``poll`` interface will be removed in Botan4.
+
+Note for writers of ``EntropySource`` subclasses: it isn't necessary to use any
+kind of cryptographic hash on your output. The data produced by an EntropySource
+is only used by an application after it has been hashed by the ``RandomNumberGenerator``
+that asked for the entropy, thus any hashing you do will be wasteful of both CPU
+cycles and entropy.
+
+The following entropy sources are currently included in the library:
+
+ * The system RNG (``/dev/urandom``, ``getrandom``, ``arc4random``,
+   ``BCryptGenRandom``, or ``RtlGenRandom``).
+ * Processor provided RNG outputs (RDRAND, RDSEED, DARN, RNDR) are used if available
+   (but not counted as contributing entropy)
+ * The ``getentropy`` call is used on OpenBSD, FreeBSD, and macOS
+ * Gathering Windows system statistics (a last ditch protection against
+   a flawed system RNG)
+
+Custom Entropy Sources
+---------------------------------
+
+On some systems (most notably baremetal embedded systems without an
+operating system) you may have to implement your own RNG and/or
+entropy source.
+
+An example of how to create an entropy source::
+
+.. literalinclude:: /../src/examples/entropy.cpp
+
+An example of how to create a custom RNG::
+
+.. literalinclude:: /../src/examples/custom_system_rng.cpp
+
+Fork Safety
+---------------------------------
+
+On Unix platforms, the ``fork()`` and ``clone()`` system calls can
+be used to spawn a new child process. Fork safety ensures that the
+child process doesn't see the same output of random bytes as the
+parent process. Botan tries to ensure fork safety by feeding the
+process ID into the internal state of the random generator and by
+automatically reseeding the random generator if the process ID
+changed between two requests of random bytes. However, this does
+not protect against PID wrap around. The process ID is usually
+implemented as a 16 bit integer. In this scenario, a process will
+spawn a new child process, which exits the parent process and
+spawns a new child process himself. If the PID wrapped around, the
+second child process may get assigned the process ID of it's
+grandparent and the fork safety can not be ensured.
+
+Therefore, it is strongly recommended to explicitly reseed any
+userspace random generators after forking a new process. If this is
+not possible in your application, prefer using the system PRNG
+instead.
+
+Snapshot and Checkpoint Restores
+---------------------------------
+
+A process or a virtual machine can also be duplicated without a fork:
+a virtual machine restored from a snapshot, a process restored from a
+checkpoint (for example with CRIU), or a function resumed from a saved
+image. The process ID does not change and no fork happens, so the
+checks above see nothing, and every copy continues from the generator
+state that was in the image. ``AutoSeeded_RNG`` mixes output of the
+system RNG into every request, which keeps its output distinct between
+the copies as long as the operating system's own generator was
+reseeded at the restore (on Linux this happens when the hypervisor
+provides a VM generation ID and the guest kernel carries the
+``vmgenid`` driver). On processors whose hardware RNG instruction
+(``rdrand``, ``darn``, or ``rndr``) is fast enough for routine use,
+its output is mixed in as well, which does not depend on the guest
+kernel being notified at all. The internal state is still the image's
+until the next reseed.
+
+Therefore, as after a fork, it is strongly recommended to explicitly
+reseed any userspace random generators after a restore. An application
+can learn of a restore from its platform (a restore hook, or on Linux
+7.0 and later the ``vm_generation_counter`` of the VMClock page,
+``/dev/vmclock0``, which changes when the machine is loaded from a
+snapshot); if no such signal is available, prefer using the system
+PRNG instead.

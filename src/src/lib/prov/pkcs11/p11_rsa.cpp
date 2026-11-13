@@ -1,0 +1,477 @@
+/*
+* PKCS#11 RSA
+* (C) 2016 Daniel Neus, Sirrix AG
+* (C) 2016 Philipp Weber, Sirrix AG
+*
+* Botan is released under the Simplified BSD License (see license.txt)
+*/
+
+#include <botan/p11_rsa.h>
+
+#include <botan/pk_keys.h>
+
+#if defined(BOTAN_HAS_RSA)
+
+   #include <botan/assert.h>
+   #include <botan/mem_ops.h>
+   #include <botan/numthry.h>
+   #include <botan/p11_mechanism.h>
+   #include <botan/pk_options_readers.h>
+   #include <botan/pss_params.h>
+   #include <botan/pubkey.h>
+   #include <botan/rng.h>
+   #include <botan/internal/blinding.h>
+   #include <botan/internal/mod_inv.h>
+   #include <botan/internal/monty.h>
+   #include <botan/internal/monty_exp.h>
+   #include <botan/internal/p11_object_guard.h>
+   #include <botan/internal/p11_sig_stream.h>
+   #include <botan/internal/pk_ops_impl.h>
+   #include <botan/internal/pk_options_impl.h>
+
+namespace Botan::PKCS11 {
+
+RSA_PublicKeyImportProperties::RSA_PublicKeyImportProperties(const BigInt& modulus, const BigInt& pub_exponent) :
+      PublicKeyProperties(KeyType::Rsa), m_modulus(modulus), m_pub_exponent(pub_exponent) {
+   add_binary(AttributeType::Modulus, m_modulus.serialize());
+   add_binary(AttributeType::PublicExponent, m_pub_exponent.serialize());
+}
+
+RSA_PublicKeyGenerationProperties::RSA_PublicKeyGenerationProperties(Ulong bits) : PublicKeyProperties(KeyType::Rsa) {
+   add_numeric(AttributeType::ModulusBits, bits);
+}
+
+PKCS11_RSA_PublicKey::PKCS11_RSA_PublicKey(Session& session, ObjectHandle handle) :
+      Object(session, handle),
+      RSA_PublicKey(BigInt::from_bytes(get_attribute_value(AttributeType::Modulus)),
+                    BigInt::from_bytes(get_attribute_value(AttributeType::PublicExponent))) {}
+
+namespace {
+
+// Validate before creating the token object, so invalid input leaves nothing behind
+const RSA_PublicKeyImportProperties& check_rsa_public_key(const RSA_PublicKeyImportProperties& props) {
+   const RSA_PublicKey key(props.modulus(), props.pub_exponent());
+   BOTAN_UNUSED(key);
+   return props;  // NOLINT(*-return-const-ref-from-parameter)
+}
+
+}  // namespace
+
+PKCS11_RSA_PublicKey::PKCS11_RSA_PublicKey(Session& session, const RSA_PublicKeyImportProperties& pubkey_props) :
+      Object(session, check_rsa_public_key(pubkey_props)),
+      RSA_PublicKey(pubkey_props.modulus(), pubkey_props.pub_exponent()) {}
+
+RSA_PrivateKeyImportProperties::RSA_PrivateKeyImportProperties(const BigInt& modulus, const BigInt& priv_exponent) :
+      PrivateKeyProperties(KeyType::Rsa), m_modulus(modulus), m_priv_exponent(priv_exponent) {
+   add_binary(AttributeType::Modulus, m_modulus.serialize());
+   add_binary(AttributeType::PrivateExponent, m_priv_exponent.serialize());
+}
+
+PKCS11_RSA_PrivateKey::PKCS11_RSA_PrivateKey(Session& session, ObjectHandle handle) :
+      Object(session, handle),
+      RSA_PublicKey(BigInt::from_bytes(get_attribute_value(AttributeType::Modulus)),
+                    BigInt::from_bytes(get_attribute_value(AttributeType::PublicExponent))) {}
+
+PKCS11_RSA_PrivateKey::PKCS11_RSA_PrivateKey(Session& session, const RSA_PrivateKeyImportProperties& priv_key_props) :
+      Object(session, priv_key_props) {
+   Object_Creation_Guard guard(session, {handle()});
+   BigInt n = priv_key_props.modulus();
+   BigInt e = BigInt::from_bytes(get_attribute_value(AttributeType::PublicExponent));
+   RSA_PublicKey::init(std::move(n), std::move(e));
+   guard.release();
+}
+
+PKCS11_RSA_PrivateKey::PKCS11_RSA_PrivateKey(Session& session,
+                                             uint32_t bits,
+                                             const RSA_PrivateKeyGenerationProperties& priv_key_props) :
+      Object(session) {
+   RSA_PublicKeyGenerationProperties pub_key_props(bits);
+   pub_key_props.set_encrypt(true);
+   pub_key_props.set_verify(true);
+   pub_key_props.set_token(false);  // don't create a persistent public key object
+
+   ObjectHandle pub_key_handle = CK_INVALID_HANDLE;
+   ObjectHandle priv_key_handle = CK_INVALID_HANDLE;
+   const Mechanism mechanism = {static_cast<CK_MECHANISM_TYPE>(MechanismType::RsaPkcsKeyPairGen), nullptr, 0};
+   session.module()->C_GenerateKeyPair(session.handle(),
+                                       &mechanism,
+                                       pub_key_props.data(),
+                                       checked_ulong_cast(pub_key_props.count()),
+                                       priv_key_props.data(),
+                                       checked_ulong_cast(priv_key_props.count()),
+                                       &pub_key_handle,
+                                       &priv_key_handle);
+
+   // The public key object is only needed temporarily
+   const Object_Creation_Guard destroy_public(session, {pub_key_handle});
+   Object_Creation_Guard guard(session, {priv_key_handle});
+
+   this->reset_handle(priv_key_handle);
+
+   BigInt n = BigInt::from_bytes(get_attribute_value(AttributeType::Modulus));
+   BigInt e = BigInt::from_bytes(get_attribute_value(AttributeType::PublicExponent));
+   RSA_PublicKey::init(std::move(n), std::move(e));
+   guard.release();
+}
+
+RSA_PrivateKey PKCS11_RSA_PrivateKey::export_key() const {
+   auto p = get_attribute_value(AttributeType::Prime1);
+   auto q = get_attribute_value(AttributeType::Prime2);
+   auto e = get_attribute_value(AttributeType::PublicExponent);
+   auto d = get_attribute_value(AttributeType::PrivateExponent);
+   auto n = get_attribute_value(AttributeType::Modulus);
+
+   return RSA_PrivateKey(BigInt::from_bytes(p),
+                         BigInt::from_bytes(q),
+                         BigInt::from_bytes(e),
+                         BigInt::from_bytes(d),
+                         BigInt::from_bytes(n));
+}
+
+std::unique_ptr<Public_Key> PKCS11_RSA_PrivateKey::public_key() const {
+   return std::make_unique<RSA_PublicKey>(BigInt::from_bytes(get_attribute_value(AttributeType::Modulus)),
+                                          BigInt::from_bytes(get_attribute_value(AttributeType::PublicExponent)));
+}
+
+secure_vector<uint8_t> PKCS11_RSA_PrivateKey::private_key_bits() const {
+   return export_key().private_key_bits();
+}
+
+namespace {
+// note: multiple-part decryption operations (with C_DecryptUpdate/C_DecryptFinal)
+// are not supported (PK_Ops::Decryption does not provide an `update` method)
+class PKCS11_RSA_Decryption_Operation final : public PK_Ops::Decryption {
+   public:
+      PKCS11_RSA_Decryption_Operation(const PKCS11_RSA_PrivateKey& key,
+                                      const PK_Encryption_Options_Reader& options,
+                                      RandomNumberGenerator& rng) :
+            m_key(key),
+            m_mechanism(MechanismWrapper::create_rsa_crypt_mechanism(options)),
+            m_mod_n(Barrett_Reduction::for_public_modulus(m_key.get_n())),
+            m_monty_n(m_key.get_n(), m_mod_n),
+            m_bits(m_key.get_n().bits() - 1),
+            m_blinder(
+               m_mod_n,
+               rng,
+               [this](const BigInt& k) {
+                  const size_t powm_window = 1;
+                  const auto powm_m_n = monty_precompute(m_monty_n, k, powm_window);
+                  return monty_execute_vartime(*powm_m_n, m_key.get_e()).value();
+               },
+               [this](const BigInt& k) { return inverse_mod_rsa_public_modulus(k, m_key.get_n()); }) {}
+
+      size_t plaintext_length(size_t /*ctext_len*/) const override { return m_key.get_n().bytes(); }
+
+      size_t ciphertext_length(size_t /*ptext_len*/) const override { return m_key.get_n().bytes(); }
+
+      size_t decrypt(uint8_t& valid_mask, std::span<uint8_t> ptext, std::span<const uint8_t> ctext) override {
+         valid_mask = 0;
+
+         const size_t modulus_bytes = (m_key.get_n().bits() + 7) / 8;
+
+         // blind for RSA/RAW decryption
+         const bool use_blinding = m_mechanism.padding_size() == 0;
+
+         std::vector<uint8_t> encrypted_data(ctext.begin(), ctext.end());
+
+         if(use_blinding) {
+            // RFC 8017 5.1.2: ciphertext representative must be in [0, n-1];
+            // check before blinding (which reduces mod n).
+            if(encrypted_data.size() != modulus_bytes) {
+               return 0;
+            }
+            const BigInt input_bn = BigInt::from_bytes(encrypted_data);
+            if(input_bn.is_zero() || input_bn >= m_key.get_n()) {
+               return 0;
+            }
+            const BigInt blinded = m_blinder.blind(input_bn);
+            // SoftHSM at least requires raw RSA inputs be == the modulus size
+            encrypted_data = blinded.serialize(modulus_bytes);
+         }
+
+         m_key.module()->C_DecryptInit(m_key.session().handle(), m_mechanism.data(), m_key.handle());
+
+         secure_vector<uint8_t> decrypted_data;
+         try {
+            m_key.module()->C_Decrypt(m_key.session().handle(), encrypted_data, decrypted_data);
+            valid_mask = 0xFF;
+         } catch(PKCS11_Error&) {
+            decrypted_data.clear();
+         }
+
+         // Unblind for RSA/RAW decryption
+         if(use_blinding) {
+            const BigInt unblinded = m_blinder.unblind(BigInt::from_bytes(decrypted_data));
+            decrypted_data.resize(modulus_bytes);
+            unblinded.serialize_to(decrypted_data);
+         }
+
+         BOTAN_ARG_CHECK(ptext.size() >= decrypted_data.size(), "Output buffer too small for decryption");
+         copy_mem(ptext.first(decrypted_data.size()), decrypted_data);
+         return decrypted_data.size();
+      }
+
+   private:
+      PKCS11_RSA_PrivateKey m_key;
+      MechanismWrapper m_mechanism;
+      Barrett_Reduction m_mod_n;
+      const Montgomery_Params m_monty_n;
+      size_t m_bits;
+      Blinder m_blinder;
+};
+
+// note: multiple-part decryption operations (with C_DecryptUpdate/C_DecryptFinal)
+// are not supported (PK_Ops::Decryption does not provide an `update` method)
+class PKCS11_RSA_Decryption_Operation_Software_EME final : public PK_Ops::Decryption_with_Padding {
+   public:
+      PKCS11_RSA_Decryption_Operation_Software_EME(const PKCS11_RSA_PrivateKey& key,
+                                                   const PK_Encryption_Options_Reader& options,
+                                                   RandomNumberGenerator& rng) :
+            PK_Ops::Decryption_with_Padding(options),
+            m_raw_op(key, PK_Options_Reader_Access::read(PK_Encryption_Options().with_padding("Raw")), rng) {}
+
+      size_t plaintext_length(size_t ctext_len) const override { return m_raw_op.plaintext_length(ctext_len); }
+
+      size_t ciphertext_length(size_t ptext_len) const override { return m_raw_op.ciphertext_length(ptext_len); }
+
+      secure_vector<uint8_t> raw_decrypt(std::span<const uint8_t> input) override {
+         /*
+         * RFC 8017 7.1.2 and 7.2.2
+         *
+         *  If the length of the ciphertext C is not k octets, output
+         *  "decryption error" and stop.
+         */
+         if(input.size() != m_raw_op.ciphertext_length(0)) {
+            throw Decoding_Error("RSA ciphertext is an incorrect size for this public key");
+         }
+
+         // Returns the fixed-width RSA encoded message (I2OSP(m, k)); the outer
+         // PKCS#1 / OAEP unpadder relies on the leading 0x00 byte being preserved.
+         uint8_t valid_mask = 0;
+         secure_vector<uint8_t> raw(m_raw_op.plaintext_length(input.size()));
+         raw.resize(m_raw_op.decrypt(valid_mask, raw, input));
+         return raw;
+      }
+
+   private:
+      PKCS11_RSA_Decryption_Operation m_raw_op;
+};
+
+// note: multiple-part encryption operations (with C_EncryptUpdate/C_EncryptFinal)
+// are not supported (PK_Ops::Encryption does not provide an `update` method)
+class PKCS11_RSA_Encryption_Operation final : public PK_Ops::Encryption {
+   public:
+      PKCS11_RSA_Encryption_Operation(const PKCS11_RSA_PublicKey& key, const PK_Encryption_Options_Reader& options) :
+            m_key(key), m_mechanism(MechanismWrapper::create_rsa_crypt_mechanism(options)) {
+         const size_t k = key.get_n().bytes();
+         const size_t pad = m_mechanism.padding_size();
+         if(pad == 0) {
+            m_bits = 8 * k - 1;
+         } else if(k > pad) {
+            m_bits = 8 * (k - pad);
+         } else {
+            m_bits = 0;
+         }
+      }
+
+      size_t ciphertext_length(size_t /*ptext_len*/) const override { return m_key.get_n().bytes(); }
+
+      size_t max_input_bits() const override { return m_bits; }
+
+      std::vector<uint8_t> encrypt(std::span<const uint8_t> input, RandomNumberGenerator& /*rng*/) override {
+         m_key.module()->C_EncryptInit(m_key.session().handle(), m_mechanism.data(), m_key.handle());
+
+         std::vector<uint8_t> encrypted_data;
+         m_key.module()->C_Encrypt(
+            m_key.session().handle(), secure_vector<uint8_t>(input.begin(), input.end()), encrypted_data);
+         return encrypted_data;
+      }
+
+   private:
+      PKCS11_RSA_PublicKey m_key;
+      MechanismWrapper m_mechanism;
+      size_t m_bits = 0;
+};
+
+class PKCS11_RSA_Signature_Operation final : public PK_Ops::Signature {
+   public:
+      PKCS11_RSA_Signature_Operation(const PKCS11_RSA_PrivateKey& key, const PK_Signature_Options_Reader& options) :
+            m_key(key),
+            m_mechanism(MechanismWrapper::create_rsa_sign_mechanism(options)),
+            m_stream(Signature_Stream::Direction::Sign, m_key, m_mechanism) {}
+
+      size_t signature_length() const override { return m_key.get_n().bytes(); }
+
+      void update(std::span<const uint8_t> input) override { m_stream.update(input); }
+
+      std::vector<uint8_t> sign(RandomNumberGenerator& /*rng*/) override {
+         auto signature = m_stream.sign();
+         if(signature.size() != signature_length()) {
+            throw PKCS11_Error("PKCS #11 module returned an RSA signature of unexpected length");
+         }
+         return signature;
+      }
+
+      std::string hash_function() const override;
+
+      AlgorithmIdentifier algorithm_identifier() const override;
+
+   private:
+      PKCS11_RSA_PrivateKey m_key;
+      MechanismWrapper m_mechanism;
+      Signature_Stream m_stream;
+};
+
+namespace {
+
+std::string hash_function_name_from_pkcs11_rsa_mechanism_type(MechanismType type) {
+   switch(type) {
+      case MechanismType::Sha1RsaPkcs:
+      case MechanismType::Sha1RsaPkcsPss:
+      case MechanismType::Sha1RsaX931:
+         return "SHA-1";
+
+      case MechanismType::Sha224RsaPkcs:
+      case MechanismType::Sha224RsaPkcsPss:
+         return "SHA-224";
+
+      case MechanismType::Sha256RsaPkcs:
+      case MechanismType::Sha256RsaPkcsPss:
+         return "SHA-256";
+
+      case MechanismType::Sha384RsaPkcs:
+      case MechanismType::Sha384RsaPkcsPss:
+         return "SHA-384";
+
+      case MechanismType::Sha512RsaPkcs:
+      case MechanismType::Sha512RsaPkcsPss:
+         return "SHA-512";
+
+      case MechanismType::RsaX509:
+      case MechanismType::RsaX931:
+      case MechanismType::RsaPkcs:
+      case MechanismType::RsaPkcsPss:
+         return "Raw";
+
+      default:
+         throw Internal_Error("Unable to determine associated hash function of PKCS11 RSA signature operation");
+   }
+}
+
+}  // namespace
+
+std::string PKCS11_RSA_Signature_Operation::hash_function() const {
+   return hash_function_name_from_pkcs11_rsa_mechanism_type(m_mechanism.mechanism_type());
+}
+
+AlgorithmIdentifier PKCS11_RSA_Signature_Operation::algorithm_identifier() const {
+   const std::string hash = this->hash_function();
+
+   switch(m_mechanism.mechanism_type()) {
+      case MechanismType::Sha1RsaPkcs:
+      case MechanismType::Sha224RsaPkcs:
+      case MechanismType::Sha256RsaPkcs:
+      case MechanismType::Sha384RsaPkcs:
+      case MechanismType::Sha512RsaPkcs: {
+         const OID oid = OID::from_string("RSA/EMSA3(" + hash + ")");
+         return AlgorithmIdentifier(oid, AlgorithmIdentifier::USE_NULL_PARAM);
+      }
+
+      case MechanismType::Sha1RsaPkcsPss:
+      case MechanismType::Sha224RsaPkcsPss:
+      case MechanismType::Sha256RsaPkcsPss:
+      case MechanismType::Sha384RsaPkcsPss:
+      case MechanismType::Sha512RsaPkcsPss: {
+         // The hashed PSS mechanisms always use MGF1 with the message hash
+         const auto* pss = static_cast<const RsaPkcsPssParams*>(m_mechanism.data()->pParameter);
+         BOTAN_ASSERT_NONNULL(pss);
+         return AlgorithmIdentifier("RSA/PSS", PSS_Params(hash, pss->sLen).serialize());
+      }
+
+      default:
+         throw Not_Implemented("No algorithm identifier defined for RSA with this PKCS11 mechanism");
+   }
+}
+
+class PKCS11_RSA_Verification_Operation final : public PK_Ops::Verification {
+   public:
+      PKCS11_RSA_Verification_Operation(const PKCS11_RSA_PublicKey& key, const PK_Signature_Options_Reader& options) :
+            m_key(key),
+            m_mechanism(MechanismWrapper::create_rsa_sign_mechanism(options)),
+            m_stream(Signature_Stream::Direction::Verify, m_key, m_mechanism) {}
+
+      void update(std::span<const uint8_t> input) override { m_stream.update(input); }
+
+      bool is_valid_signature(std::span<const uint8_t> sig) override { return m_stream.verify(sig); }
+
+      std::string hash_function() const override;
+
+   private:
+      const PKCS11_RSA_PublicKey m_key;
+      MechanismWrapper m_mechanism;
+      Signature_Stream m_stream;
+};
+
+std::string PKCS11_RSA_Verification_Operation::hash_function() const {
+   return hash_function_name_from_pkcs11_rsa_mechanism_type(m_mechanism.mechanism_type());
+}
+
+}  // namespace
+
+std::unique_ptr<PK_Ops::Encryption> PKCS11_RSA_PublicKey::_create_encryption_op(
+   RandomNumberGenerator& rng, const PK_Encryption_Options_Reader& options) const {
+   BOTAN_UNUSED(rng);
+   require_hardware_provider(options, algo_name(), "pkcs11");
+   return std::make_unique<PKCS11_RSA_Encryption_Operation>(*this, options);
+}
+
+std::unique_ptr<PK_Ops::Verification> PKCS11_RSA_PublicKey::_create_verification_op(
+   const PK_Signature_Options_Reader& options) const {
+   require_hardware_provider(options, algo_name(), "pkcs11");
+   return std::make_unique<PKCS11_RSA_Verification_Operation>(*this, options);
+}
+
+std::unique_ptr<PK_Ops::Decryption> PKCS11_RSA_PrivateKey::_create_decryption_op(
+   RandomNumberGenerator& rng, const PK_Encryption_Options_Reader& options) const {
+   require_hardware_provider(options, algo_name(), "pkcs11");
+   if(m_use_software_padding && options.padding().value_or("Raw") != "Raw") {
+      return std::make_unique<PKCS11_RSA_Decryption_Operation_Software_EME>(*this, options, rng);
+   } else {
+      return std::make_unique<PKCS11_RSA_Decryption_Operation>(*this, options, rng);
+   }
+}
+
+std::unique_ptr<PK_Ops::Signature> PKCS11_RSA_PrivateKey::_create_signature_op(
+   RandomNumberGenerator& rng, const PK_Signature_Options_Reader& options) const {
+   BOTAN_UNUSED(rng);
+   require_hardware_provider(options, algo_name(), "pkcs11");
+   return std::make_unique<PKCS11_RSA_Signature_Operation>(*this, options);
+}
+
+PKCS11_RSA_KeyPair generate_rsa_keypair(Session& session,
+                                        const RSA_PublicKeyGenerationProperties& pub_props,
+                                        const RSA_PrivateKeyGenerationProperties& priv_props) {
+   ObjectHandle pub_key_handle = 0;
+   ObjectHandle priv_key_handle = 0;
+
+   const Mechanism mechanism = {static_cast<CK_MECHANISM_TYPE>(MechanismType::RsaPkcsKeyPairGen), nullptr, 0};
+
+   session.module()->C_GenerateKeyPair(session.handle(),
+                                       &mechanism,
+                                       pub_props.data(),
+                                       checked_ulong_cast(pub_props.count()),
+                                       priv_props.data(),
+                                       checked_ulong_cast(priv_props.count()),
+                                       &pub_key_handle,
+                                       &priv_key_handle);
+
+   Object_Creation_Guard guard(session, {pub_key_handle, priv_key_handle});
+   auto keypair =
+      std::make_pair(PKCS11_RSA_PublicKey(session, pub_key_handle), PKCS11_RSA_PrivateKey(session, priv_key_handle));
+   guard.release();
+   return keypair;
+}
+
+}  // namespace Botan::PKCS11
+
+#endif

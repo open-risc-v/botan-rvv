@@ -1,0 +1,298 @@
+/*
+* PK Operation Types
+* (C) 2010,2015,2023 Jack Lloyd
+*
+* Botan is released under the Simplified BSD License (see license.txt)
+*/
+
+#include <botan/internal/pk_ops_impl.h>
+
+#include <botan/assert.h>
+#include <botan/hash.h>
+#include <botan/kdf.h>
+#include <botan/pk_options_readers.h>
+#include <botan/rng.h>
+#include <botan/internal/ct_utils.h>
+#include <botan/internal/fmt.h>
+#include <botan/internal/parsing.h>
+#include <botan/internal/pk_options_impl.h>
+
+#if defined(BOTAN_HAS_RAW_HASH_FN)
+   #include <botan/internal/raw_hash.h>
+#endif
+
+#if defined(BOTAN_HAS_RSA_ENCRYPTION_PADDING)
+   #include <botan/internal/enc_padding.h>
+#endif
+
+namespace Botan {
+
+AlgorithmIdentifier PK_Ops::Signature::algorithm_identifier() const {
+   throw Not_Implemented("This signature scheme does not have an algorithm identifier available");
+}
+
+#if defined(BOTAN_HAS_RSA_ENCRYPTION_PADDING)
+
+PK_Ops::Encryption_with_Padding::Encryption_with_Padding(const PK_Encryption_Options_Reader& options) :
+      m_padding(EncryptionPaddingScheme::create_or_throw(options)) {}
+
+PK_Ops::Encryption_with_Padding::~Encryption_with_Padding() = default;
+
+size_t PK_Ops::Encryption_with_Padding::max_input_bits() const {
+   return 8 * m_padding->maximum_input_size(max_ptext_input_bits());
+}
+
+std::vector<uint8_t> PK_Ops::Encryption_with_Padding::encrypt(std::span<const uint8_t> msg,
+                                                              RandomNumberGenerator& rng) {
+   const size_t max_input_bits = max_ptext_input_bits();
+   const size_t max_input_bytes = (max_input_bits + 7) / 8;
+   BOTAN_ARG_CHECK(msg.size() <= max_input_bytes, "Plaintext too large");
+
+   secure_vector<uint8_t> padded_ptext(max_input_bytes);
+   const size_t written = m_padding->pad(padded_ptext, msg, max_input_bits, rng);
+   return raw_encrypt(std::span{padded_ptext}.first(written), rng);
+}
+
+PK_Ops::Decryption_with_Padding::Decryption_with_Padding(const PK_Encryption_Options_Reader& options) :
+      m_padding(EncryptionPaddingScheme::create_or_throw(options)) {}
+
+PK_Ops::Decryption_with_Padding::~Decryption_with_Padding() = default;
+
+size_t PK_Ops::Decryption_with_Padding::decrypt(uint8_t& valid_mask,
+                                                std::span<uint8_t> ptext,
+                                                std::span<const uint8_t> ctext) {
+   const secure_vector<uint8_t> raw = raw_decrypt(ctext);
+
+   // Unpadding requires space for the entire encoded message
+   BOTAN_ARG_CHECK(ptext.size() >= raw.size(), "Output buffer too small for decryption");
+
+   const auto len = m_padding->unpad(ptext, raw);
+
+   valid_mask = CT::Mask<uint8_t>::from_choice(len.has_value()).if_set_return(0xFF);
+   return len.value_or(0);
+}
+
+#endif
+
+PK_Ops::Key_Agreement_with_KDF::Key_Agreement_with_KDF(const PK_Key_Agreement_Options_Reader& options) {
+   if(options.using_kdf()) {
+      m_kdf = KDF::create_or_throw(options.kdf().value());
+   } else if(!options.using_raw_shared_key()) {
+      throw Invalid_Argument(
+         "Key agreement does not produce a uniform shared key, so a KDF must be specified (or the raw shared key "
+         "explicitly requested)");
+   }
+}
+
+PK_Ops::Key_Agreement_with_KDF::~Key_Agreement_with_KDF() = default;
+
+secure_vector<uint8_t> PK_Ops::Key_Agreement_with_KDF::agree(size_t key_len,
+                                                             std::span<const uint8_t> other_key,
+                                                             std::span<const uint8_t> salt) {
+   if(!salt.empty() && m_kdf == nullptr) {
+      throw Invalid_Argument("PK_Key_Agreement::derive_key requires a KDF to use a salt");
+   }
+
+   secure_vector<uint8_t> z = raw_agree(other_key.data(), other_key.size());
+   if(m_kdf) {
+      return m_kdf->derive_key(key_len, z, salt.data(), salt.size());
+   }
+   return z;
+}
+
+namespace {
+
+std::unique_ptr<HashFunction> validate_options_returning_hash(const PK_Signature_Options_Reader& options) {
+   // The caller provides the digest; if they named the hash, its length is checked
+   if(options.using_externally_computed_prehash()) {
+#if defined(BOTAN_HAS_RAW_HASH_FN)
+      if(auto prehash = externally_computed_prehash_name(options)) {
+         return std::make_unique<RawHashFunction>(HashFunction::create_or_throw(*prehash));
+      }
+      return std::make_unique<RawHashFunction>("Raw", 0);
+#else
+      throw Lookup_Error("Signing an externally computed prehash requires the raw_hash module");
+#endif
+   }
+
+   BOTAN_ARG_CHECK(!options.hash_function_name().empty(), "This algorithm requires a hash function for signing");
+
+   /*
+   * In a sense ECDSA/DSA are *always* in prehashing mode, so we accept the case
+   * where prehashing is requested as long as the prehash hash matches the signature hash.
+   */
+   if(options.using_prehash()) {
+      if(!options.prehash_function().has_value() ||
+         options.prehash_function().value() != options.hash_function_name()) {
+         throw Invalid_Argument("This algorithm does not support prehashing with a different hash");
+      }
+   }
+
+   return HashFunction::create_or_throw(options.hash_function_name());
+}
+
+}  // namespace
+
+PK_Ops::Signature_with_Hash::Signature_with_Hash(const PK_Signature_Options_Reader& options) :
+      Signature(), m_hash(validate_options_returning_hash(options)) {}
+
+PK_Ops::Signature_with_Hash::~Signature_with_Hash() = default;
+
+#if defined(BOTAN_HAS_RFC6979_GENERATOR)
+std::string PK_Ops::Signature_with_Hash::rfc6979_hash_function() const {
+   std::string hash = m_hash->name();
+   if(hash != "Raw") {
+      return hash;
+   }
+   return "SHA-512";
+}
+#endif
+
+std::string PK_Ops::Signature_with_Hash::hash_function() const {
+   return m_hash->name();
+}
+
+void PK_Ops::Signature_with_Hash::update(std::span<const uint8_t> msg) {
+   m_hash->update(msg);
+}
+
+std::vector<uint8_t> PK_Ops::Signature_with_Hash::sign(RandomNumberGenerator& rng) {
+   const std::vector<uint8_t> msg = m_hash->final_stdvec();
+   return raw_sign(msg, rng);
+}
+
+PK_Ops::Verification_with_Hash::Verification_with_Hash(const PK_Signature_Options_Reader& options) :
+      Verification(), m_hash(validate_options_returning_hash(options)) {}
+
+PK_Ops::Verification_with_Hash::~Verification_with_Hash() = default;
+
+std::string PK_Ops::Verification_with_Hash::hash_function() const {
+   return m_hash->name();
+}
+
+PK_Ops::Verification_with_Hash::Verification_with_Hash(const AlgorithmIdentifier& alg_id,
+                                                       std::string_view pk_algo,
+                                                       bool allow_null_parameters) {
+   const auto oid_name = alg_id.oid().registered_name();
+   if(!oid_name) {
+      throw Decoding_Error(
+         fmt("Unexpected AlgorithmIdentifier OID {} in association with {} key", alg_id.oid(), pk_algo));
+   }
+
+   const auto oid_info = split_on(*oid_name, '/');
+
+   if(oid_info.size() != 2 || oid_info[0] != pk_algo) {
+      throw Decoding_Error(
+         fmt("Unexpected AlgorithmIdentifier OID {} in association with {} key", alg_id.oid(), pk_algo));
+   }
+
+   if(!alg_id.parameters_are_empty()) {
+      if(alg_id.parameters_are_null()) {
+         if(!allow_null_parameters) {
+            throw Decoding_Error(fmt("Unexpected NULL AlgorithmIdentifier parameters for {}", pk_algo));
+         }
+      } else {
+         throw Decoding_Error(fmt("Unexpected AlgorithmIdentifier parameters for {}", pk_algo));
+      }
+   }
+
+   m_hash = HashFunction::create_or_throw(oid_info[1]);
+}
+
+void PK_Ops::Verification_with_Hash::update(std::span<const uint8_t> msg) {
+   m_hash->update(msg);
+}
+
+bool PK_Ops::Verification_with_Hash::is_valid_signature(std::span<const uint8_t> sig) {
+   const std::vector<uint8_t> msg = m_hash->final_stdvec();
+   return verify(msg, sig);
+}
+
+size_t PK_Ops::KEM_Encryption_with_KDF::shared_key_length(size_t desired_shared_key_len) const {
+   if(m_kdf) {
+      return desired_shared_key_len;
+   } else {
+      return this->raw_kem_shared_key_length();
+   }
+}
+
+void PK_Ops::KEM_Encryption_with_KDF::kem_encrypt(std::span<uint8_t> out_encapsulated_key,
+                                                  std::span<uint8_t> out_shared_key,
+                                                  RandomNumberGenerator& rng,
+                                                  size_t desired_shared_key_len,
+                                                  std::span<const uint8_t> salt) {
+   BOTAN_ARG_CHECK(salt.empty() || m_kdf, "PK_KEM_Encryptor::encrypt requires a KDF to use a salt");
+   BOTAN_ASSERT_NOMSG(out_encapsulated_key.size() == encapsulated_key_length());
+
+   if(m_kdf) {
+      BOTAN_ASSERT_EQUAL(
+         out_shared_key.size(), desired_shared_key_len, "KDF output length and shared key length match");
+
+      secure_vector<uint8_t> raw_shared(raw_kem_shared_key_length());
+      this->raw_kem_encrypt(out_encapsulated_key, raw_shared, rng);
+      m_kdf->derive_key(out_shared_key, raw_shared, salt, {});
+   } else {
+      BOTAN_ASSERT_EQUAL(out_shared_key.size(), raw_kem_shared_key_length(), "Shared key has raw KEM output length");
+      this->raw_kem_encrypt(out_encapsulated_key, out_shared_key, rng);
+   }
+}
+
+namespace {
+
+std::unique_ptr<KDF> kem_kdf_from_options(const PK_KEM_Options_Reader& options, PK_Ops::KemSharedKeyQuality raw_key) {
+   if(options.using_kdf()) {
+      return KDF::create_or_throw(options.kdf().value());
+   }
+
+   if(!options.using_raw_shared_key() && raw_key == PK_Ops::KemSharedKeyQuality::RequiresKDF) {
+      throw Invalid_Argument(
+         "This KEM does not produce a uniform shared key, so a KDF must be specified (or the raw shared key "
+         "explicitly requested)");
+   }
+
+   // No KDF; the raw shared key is used directly
+   return nullptr;
+}
+
+}  // namespace
+
+PK_Ops::KEM_Encryption_with_KDF::KEM_Encryption_with_KDF(const PK_KEM_Options_Reader& options,
+                                                         KemSharedKeyQuality raw_key) :
+      m_kdf(kem_kdf_from_options(options, raw_key)) {}
+
+PK_Ops::KEM_Encryption_with_KDF::~KEM_Encryption_with_KDF() = default;
+
+size_t PK_Ops::KEM_Decryption_with_KDF::shared_key_length(size_t desired_shared_key_len) const {
+   if(m_kdf) {
+      return desired_shared_key_len;
+   } else {
+      return this->raw_kem_shared_key_length();
+   }
+}
+
+void PK_Ops::KEM_Decryption_with_KDF::kem_decrypt(std::span<uint8_t> out_shared_key,
+                                                  std::span<const uint8_t> encapsulated_key,
+                                                  size_t desired_shared_key_len,
+                                                  std::span<const uint8_t> salt) {
+   BOTAN_ARG_CHECK(salt.empty() || m_kdf, "PK_KEM_Decryptor::decrypt requires a KDF to use a salt");
+
+   if(m_kdf) {
+      BOTAN_ASSERT_EQUAL(
+         out_shared_key.size(), desired_shared_key_len, "KDF output length and shared key length match");
+
+      secure_vector<uint8_t> raw_shared(raw_kem_shared_key_length());
+      this->raw_kem_decrypt(raw_shared, encapsulated_key);
+      m_kdf->derive_key(out_shared_key, raw_shared, salt, {});
+   } else {
+      BOTAN_ASSERT_EQUAL(out_shared_key.size(), raw_kem_shared_key_length(), "Shared key has raw KEM output length");
+      this->raw_kem_decrypt(out_shared_key, encapsulated_key);
+   }
+}
+
+PK_Ops::KEM_Decryption_with_KDF::KEM_Decryption_with_KDF(const PK_KEM_Options_Reader& options,
+                                                         KemSharedKeyQuality raw_key) :
+      m_kdf(kem_kdf_from_options(options, raw_key)) {}
+
+PK_Ops::KEM_Decryption_with_KDF::~KEM_Decryption_with_KDF() = default;
+
+}  // namespace Botan

@@ -1,0 +1,1227 @@
+/*
+* RSA
+* (C) 1999-2010,2015,2016,2018,2019,2023 Jack Lloyd
+*
+* Botan is released under the Simplified BSD License (see license.txt)
+*/
+
+#include <botan/rsa.h>
+
+#include <botan/ber_dec.h>
+#include <botan/der_enc.h>
+#include <botan/mutex.h>
+#include <botan/numthry.h>
+#include <botan/pss_params.h>
+#include <botan/internal/algorithm_spec.h>
+#include <botan/internal/barrett.h>
+#include <botan/internal/ct_utils.h>
+#include <botan/internal/divide.h>
+#include <botan/internal/fmt.h>
+#include <botan/internal/keypair.h>
+#include <botan/internal/mod_inv.h>
+#include <botan/internal/monty.h>
+#include <botan/internal/monty_exp.h>
+#include <botan/internal/mp_core.h>
+#include <botan/internal/parsing.h>
+#include <botan/internal/pk_ops_impl.h>
+#include <botan/internal/pk_options_impl.h>
+#include <botan/internal/sig_padding.h>
+#include <botan/internal/target_info.h>
+#include <botan/internal/workfactor.h>
+
+#if defined(BOTAN_HAS_THREAD_UTILS)
+   #include <botan/internal/thread_pool.h>
+#endif
+
+#if defined(BOTAN_HAS_THREAD_UTILS) && !defined(BOTAN_HAS_VALGRIND)
+   #define BOTAN_RSA_USE_ASYNC
+#endif
+
+namespace Botan {
+
+namespace {
+
+// This is an arbitrary upper bound of the size of a RSA modulus
+constexpr size_t MAX_RSA_BITS = 16384;
+
+}  // namespace
+
+class RSA_Public_Data final {
+   public:
+      RSA_Public_Data(BigInt&& n, BigInt&& e) :
+            m_n(std::move(n)),
+            m_e(std::move(e)),
+            m_mod_n(Barrett_Reduction::for_public_modulus(m_n)),
+            m_monty_n(m_n, m_mod_n),
+            m_public_modulus_bits(m_n.bits()),
+            m_public_modulus_bytes(m_n.bytes()) {}
+
+      BigInt public_op(const BigInt& m) const {
+         const size_t powm_window = 1;
+         const auto powm_m_n = monty_precompute(m_monty_n, m, powm_window);
+         return monty_execute_vartime(*powm_m_n, m_e).value();
+      }
+
+      const BigInt& get_n() const { return m_n; }
+
+      const BigInt& get_e() const { return m_e; }
+
+      size_t public_modulus_bits() const { return m_public_modulus_bits; }
+
+      size_t public_modulus_bytes() const { return m_public_modulus_bytes; }
+
+      const Montgomery_Params& monty_n() const { return m_monty_n; }
+
+      const Barrett_Reduction& reducer_mod_n() const { return m_mod_n; }
+
+   private:
+      BigInt m_n;
+      BigInt m_e;
+      Barrett_Reduction m_mod_n;
+      const Montgomery_Params m_monty_n;
+      size_t m_public_modulus_bits;
+      size_t m_public_modulus_bytes;
+};
+
+namespace {
+
+/*
+* To recover the final value from the CRT representation (j1,j2)
+* we use Garner's algorithm:
+* c = q^-1 mod p (this is precomputed)
+* h = c*(j1-j2) mod p
+* r = h*q + j2
+*/
+BigInt crt_recombine(const Montgomery_Int& j1,
+                     const Montgomery_Int& j2_p,
+                     const BigInt& j2,
+                     const Montgomery_Int& c_monty,
+                     const BigInt& p,
+                     const BigInt& q) {
+   // We skip CRT entirely if the primes are not balanced (same bitlength) so q is also of this size
+   const size_t p_words = p.sig_words();
+   BOTAN_ASSERT_NOMSG(p_words == q.sig_words());
+
+   const size_t n_words = 2 * p_words;
+
+   // Ensure sufficient storage
+   BOTAN_ASSERT_NOMSG(j1.repr().size() >= p_words);
+   BOTAN_ASSERT_NOMSG(j2_p.repr().size() >= p_words);
+   BOTAN_ASSERT_NOMSG(j2.size() >= p_words);
+
+   /*
+   * Compute h = (j1 - j2) * c mod p
+   *
+   * This doesn't quite match up with the "Smooth-CRT" proposal; there we would
+   * multiply by a precomputed c * R2, which would have the effect of both
+   * multiplying by c and immediately converting from Montgomery to standard form.
+   */
+   secure_vector<word> ws(2 * p_words);
+
+   const Montgomery_Int h_monty = (j1 - j2_p).mul(c_monty, ws);
+
+   const BigInt h = h_monty.value();
+   // Montgomery_Int always returns values sized to the modulus
+   BOTAN_ASSERT_NOMSG(h.size() >= p_words);
+   BOTAN_DEBUG_ASSERT(h.sig_words() <= p_words);
+
+   // Compute r = h * q
+   secure_vector<word> r(2 * p_words);
+
+   bigint_mul(r.data(), r.size(), h._data(), h.size(), p_words, q._data(), q.size(), p_words, ws.data(), ws.size());
+
+   // r += j2
+   const word carry = bigint_add2(r.data(), n_words, j2._data(), p_words);
+   // should not be possible since it would imply r > the public modulus
+   BOTAN_ASSERT_NOMSG(CT::driveby_unpoison(carry == 0));
+
+   return BigInt::_from_words(r);
+}
+
+/*
+* Compute d + m*(p - 1), with lengths that depend only on the sizes of the
+* inputs, not on their values
+*/
+BigInt blind_exponent(const BigInt& d, const BigInt& m, const BigInt& p_minus_1) {
+   const size_t m_words = m.size();
+   const size_t p_words = p_minus_1.size();
+
+   secure_vector<word> z(m_words + p_words + 1);
+   BOTAN_ASSERT_NOMSG(d.size() <= z.size());
+
+   bigint_mul(z.data(), z.size(), m._data(), m_words, m_words, p_minus_1._data(), p_words, p_words, nullptr, 0);
+   const word carry = bigint_add2(z.data(), z.size(), d._data(), d.size());
+   BOTAN_ASSERT_NOMSG(CT::driveby_unpoison(carry == 0));
+
+   return BigInt::_from_words(z);
+}
+
+}  // namespace
+
+class RSA_Private_Data final {
+   public:
+      RSA_Private_Data(std::shared_ptr<const RSA_Public_Data> pub,
+                       BigInt&& d,
+                       BigInt&& p,
+                       BigInt&& q,
+                       BigInt&& d1,
+                       BigInt&& d2,
+                       BigInt&& c) :
+            m_public(std::move(pub)),
+            m_d(std::move(d)),
+            m_p(std::move(p)),
+            m_q(std::move(q)),
+            m_d1(std::move(d1)),
+            m_d2(std::move(d2)),
+            m_c(std::move(c)),
+            m_p_minus_1(m_p - 1),
+            m_q_minus_1(m_q - 1),
+            m_monty_p(m_p),
+            m_monty_q(m_q),
+            m_c_monty(m_monty_p, m_c),
+            m_p_bits(m_p.bits()),
+            m_q_bits(m_q.bits()) {}
+
+      const BigInt& get_d() const { return m_d; }
+
+      const BigInt& get_p() const { return m_p; }
+
+      const BigInt& get_q() const { return m_q; }
+
+      const BigInt& get_d1() const { return m_d1; }
+
+      const BigInt& get_d2() const { return m_d2; }
+
+      BigInt blinded_d1(const BigInt& m) const { return blind_exponent(m_d1, m, m_p_minus_1); }
+
+      BigInt blinded_d2(const BigInt& m) const { return blind_exponent(m_d2, m, m_q_minus_1); }
+
+      const BigInt& get_c() const { return m_c; }
+
+      const Montgomery_Int& get_c_monty() const { return m_c_monty; }
+
+      const Montgomery_Params& monty_p() const { return m_monty_p; }
+
+      const Montgomery_Params& monty_q() const { return m_monty_q; }
+
+      size_t p_bits() const { return m_p_bits; }
+
+      size_t q_bits() const { return m_q_bits; }
+
+      bool primes_imbalanced() const { return p_bits() != q_bits(); }
+
+      void _const_time_poison() const {
+         CT::poison_all(m_d,
+                        m_p,
+                        m_q,
+                        m_d1,
+                        m_d2,
+                        m_c,
+                        m_p_minus_1,
+                        m_q_minus_1,
+                        m_monty_p,
+                        m_monty_q,
+                        m_c_monty,
+                        m_blinding_fwd,
+                        m_blinding_inv);
+      }
+
+      void _const_time_unpoison() const {
+         CT::unpoison_all(m_d,
+                          m_p,
+                          m_q,
+                          m_d1,
+                          m_d2,
+                          m_c,
+                          m_p_minus_1,
+                          m_q_minus_1,
+                          m_monty_p,
+                          m_monty_q,
+                          m_c_monty,
+                          m_blinding_fwd,
+                          m_blinding_inv);
+      }
+
+      /**
+      * Return the next pair of base blinding values (k^e mod n, k^-1 mod n)
+      *
+      * The blinding sequence is shared by all private key operations using this
+      * key. Each pair is the square of the previous one; after BlindingReinitInterval
+      * uses a fresh random k is chosen.
+      */
+      std::pair<BigInt, BigInt> next_blinding_pair(RandomNumberGenerator& rng) const {
+         const lock_guard_type<mutex_type> lock(m_blinding_mutex);
+
+         if(m_blinding_uses == 0 || m_blinding_uses >= BlindingReinitInterval) {
+            // TODO the fresh pair could be computed ahead of time (eg in the thread
+            // pool) so that no operation has to wait for it
+            const BigInt k(rng, m_public->public_modulus_bits() - 1);
+            CT::poison(k);
+            auto [fwd, inv] = fresh_blinding_pair(k);
+            m_blinding_fwd = std::move(fwd);
+            m_blinding_inv = std::move(inv);
+            m_blinding_uses = 0;
+         } else {
+            const auto& mod_n = m_public->reducer_mod_n();
+            m_blinding_fwd = mod_n.square(m_blinding_fwd);
+            m_blinding_inv = mod_n.square(m_blinding_inv);
+         }
+
+         m_blinding_uses += 1;
+         return {m_blinding_fwd, m_blinding_inv};
+      }
+
+   private:
+      static constexpr size_t BlindingReinitInterval = 64;
+
+      // (k^e mod n, k^-1 mod n) for a fresh blinding nonce k
+      std::pair<BigInt, BigInt> fresh_blinding_pair(const BigInt& k) const {
+         if(primes_imbalanced()) {
+            return {m_public->public_op(k), inverse_mod_rsa_public_modulus(k, m_public->get_n())};
+         }
+         return crt_blinding_pair(m_public->get_e(), k);
+      }
+
+      /*
+      * (k^e mod n, k^-1 mod n) via the CRT, with the two halves computed in
+      * parallel when possible. The exponent e is public so variable time
+      * exponentiation is fine; the two half-size inversions are ~2x cheaper
+      * than a single inversion modulo n.
+      */
+      std::pair<BigInt, BigInt> crt_blinding_pair(const BigInt& e, const BigInt& k) const {
+         const auto kp_monty = Montgomery_Int::from_wide_int(m_monty_p, k);
+         const auto kq_monty = Montgomery_Int::from_wide_int(m_monty_q, k);
+         const BigInt kp = kp_monty.value();
+         const BigInt kq = kq_monty.value();
+
+         // k is random and less than n, so this means we stumbled onto a factor of n
+         if(kp.is_zero() || kq.is_zero()) {
+            throw Internal_Error("Accidentally factored the public modulus");
+         }
+
+         // Returns (k^e, k^-1) modulo the prime, the former still in Montgomery form
+         auto half = [&e](const Montgomery_Int& k_monty, const BigInt& k_mod, const BigInt& prime) {
+            const size_t powm_window = 1;
+            auto fwd = monty_execute_vartime(*monty_precompute(k_monty, powm_window), e);
+            auto inv = inverse_mod_secret_prime(k_mod, prime);
+            return std::make_pair(std::move(fwd), std::move(inv));
+         };
+
+#if defined(BOTAN_RSA_USE_ASYNC)
+         // Precompute e.sig_words in the main thread, see rsa_private_op
+         e.sig_words();
+
+         auto future_p = Thread_Pool::global_instance().run([&]() { return half(kp_monty, kp, m_p); });
+#endif
+
+         const auto [fwd_q, inv_q] = half(kq_monty, kq, m_q);
+
+#if defined(BOTAN_RSA_USE_ASYNC)
+         const auto [fwd_p, inv_p] = future_p.get();
+#else
+         const auto [fwd_p, inv_p] = half(kp_monty, kp, m_p);
+#endif
+
+         const BigInt fwd_q_v = fwd_q.value();
+         const Montgomery_Int inv_p_monty(m_monty_p, inv_p);
+
+         return {
+            crt_recombine(fwd_p, Montgomery_Int::from_wide_int(m_monty_p, fwd_q_v), fwd_q_v, m_c_monty, m_p, m_q),
+            crt_recombine(inv_p_monty, Montgomery_Int::from_wide_int(m_monty_p, inv_q), inv_q, m_c_monty, m_p, m_q)};
+      }
+
+      std::shared_ptr<const RSA_Public_Data> m_public;
+      BigInt m_d;
+      BigInt m_p;
+      BigInt m_q;
+      BigInt m_d1;
+      BigInt m_d2;
+      BigInt m_c;
+      BigInt m_p_minus_1;
+      BigInt m_q_minus_1;
+
+      const Montgomery_Params m_monty_p;
+      const Montgomery_Params m_monty_q;
+      Montgomery_Int m_c_monty;
+      size_t m_p_bits;
+      size_t m_q_bits;
+
+      mutable mutex_type m_blinding_mutex;
+      mutable BigInt m_blinding_fwd;
+      mutable BigInt m_blinding_inv;
+      mutable size_t m_blinding_uses = 0;
+};
+
+std::shared_ptr<const RSA_Public_Data> RSA_PublicKey::public_data() const {
+   return m_public;
+}
+
+const BigInt& RSA_PublicKey::get_int_field(std::string_view field) const {
+   if(field == "n") {
+      return m_public->get_n();
+   } else if(field == "e") {
+      return m_public->get_e();
+   } else {
+      return Public_Key::get_int_field(field);
+   }
+}
+
+std::unique_ptr<Private_Key> RSA_PublicKey::generate_another(RandomNumberGenerator& rng) const {
+   return std::make_unique<RSA_PrivateKey>(rng, m_public->public_modulus_bits(), 65537);
+}
+
+const BigInt& RSA_PublicKey::get_n() const {
+   return m_public->get_n();
+}
+
+const BigInt& RSA_PublicKey::get_e() const {
+   return m_public->get_e();
+}
+
+void RSA_PublicKey::init(BigInt&& n, BigInt&& e) {
+   if(n.signum() <= 0 || n.is_even() || n.bits() < 384 || n.bits() > MAX_RSA_BITS) {
+      throw Decoding_Error("Invalid RSA public key modulus");
+   }
+   if(e.is_even() || e <= 1 || e >= n || e.bits() > 256) {
+      throw Decoding_Error("Invalid RSA public key exponent");
+   }
+   m_public = std::make_shared<RSA_Public_Data>(std::move(n), std::move(e));
+}
+
+RSA_PublicKey::RSA_PublicKey(const AlgorithmIdentifier& alg_id, std::span<const uint8_t> key_bits) {
+   // RFC 4055 Section 1.2 has that parameters MUST be NULL, but historical
+   // reasons make that difficult to enforce, so absent is also accepted.
+   //
+   // This only checks rsaEncryption; PSS/OAEP key identifiers have their own parameter encoding
+   if(alg_id.oid().registered_name() == "RSA" && !alg_id.parameters_are_null_or_empty()) {
+      throw Decoding_Error("Unexpected parameters for RSA public key");
+   }
+
+   BigInt n;
+   BigInt e;
+   BER_Decoder(key_bits, BER_Decoder::Limits::DER()).start_sequence().decode(n).decode(e).end_cons().verify_end();
+
+   init(std::move(n), std::move(e));
+}
+
+bool RSA_PublicKey::supports_operation(PublicKeyOperation op) const {
+   return op == PublicKeyOperation::Signature || op == PublicKeyOperation::Encryption ||
+          op == PublicKeyOperation::KeyEncapsulation;
+}
+
+RSA_PublicKey::RSA_PublicKey(const BigInt& modulus, const BigInt& exponent) {
+   BigInt n = modulus;
+   BigInt e = exponent;
+   init(std::move(n), std::move(e));
+}
+
+size_t RSA_PublicKey::key_length() const {
+   return m_public->public_modulus_bits();
+}
+
+size_t RSA_PublicKey::estimated_strength() const {
+   return if_work_factor(key_length());
+}
+
+AlgorithmIdentifier RSA_PublicKey::algorithm_identifier() const {
+   return AlgorithmIdentifier(object_identifier(), AlgorithmIdentifier::USE_NULL_PARAM);
+}
+
+std::vector<uint8_t> RSA_PublicKey::raw_public_key_bits() const {
+   throw Not_Implemented("an RSA public key does not provide a raw binary representation.");
+}
+
+std::vector<uint8_t> RSA_PublicKey::public_key_bits() const {
+   std::vector<uint8_t> output;
+   DER_Encoder der(output);
+   der.start_sequence().encode(get_n()).encode(get_e()).end_cons();
+
+   return output;
+}
+
+/*
+* Check RSA Public Parameters
+*/
+bool RSA_PublicKey::check_key(RandomNumberGenerator& /*rng*/, bool /*strong*/) const {
+   // TODO(Botan4) increase this to at least 512 bit minimum modulus...
+   if(get_n() < 35 || get_n().is_even() || get_e() < 3 || get_e().is_even()) {
+      return false;
+   }
+   return true;
+}
+
+std::shared_ptr<const RSA_Private_Data> RSA_PrivateKey::private_data() const {
+   return m_private;
+}
+
+secure_vector<uint8_t> RSA_PrivateKey::private_key_bits() const {
+   return DER_Encoder()
+      .start_sequence()
+      .encode(static_cast<size_t>(0))
+      .encode(get_n())
+      .encode(get_e())
+      .encode(get_d())
+      .encode(get_p())
+      .encode(get_q())
+      .encode(get_d1())
+      .encode(get_d2())
+      .encode(get_c())
+      .end_cons()
+      .get_contents();
+}
+
+const BigInt& RSA_PrivateKey::get_p() const {
+   return m_private->get_p();
+}
+
+const BigInt& RSA_PrivateKey::get_q() const {
+   return m_private->get_q();
+}
+
+const BigInt& RSA_PrivateKey::get_d() const {
+   return m_private->get_d();
+}
+
+const BigInt& RSA_PrivateKey::get_c() const {
+   return m_private->get_c();
+}
+
+const BigInt& RSA_PrivateKey::get_d1() const {
+   return m_private->get_d1();
+}
+
+const BigInt& RSA_PrivateKey::get_d2() const {
+   return m_private->get_d2();
+}
+
+namespace {
+
+void check_rsa_private_key_params(const BigInt& n, const BigInt& p, const BigInt& q) {
+   if(n.bits() > MAX_RSA_BITS || p < 3 || q < 3 || p == q || p >= n || q >= n) {
+      throw Decoding_Error("Invalid RSA private key parameters");
+   }
+   if(p * q != n) {
+      throw Decoding_Error("Invalid RSA private key: p * q != n");
+   }
+}
+
+/*
+* Verify e*d == 1 mod lcm(p-1, q-1). Checking modulo p-1 and q-1 separately
+* is equivalent and avoids the (costly, constant time) gcd needed for the lcm.
+*/
+void check_rsa_secret_exponent(const BigInt& e, const BigInt& d, const BigInt& p, const BigInt& q) {
+   const auto scope = CT::scoped_poison(d, p, q);
+   const BigInt ed = e * d;
+   if(ct_modulo(ed, p - 1) != 1 || ct_modulo(ed, q - 1) != 1) {
+      throw Decoding_Error("Invalid RSA private key: e * d != 1 mod lcm(p-1, q-1)");
+   }
+}
+
+}  // namespace
+
+void RSA_PrivateKey::init(BigInt&& d, BigInt&& p, BigInt&& q, BigInt&& d1, BigInt&& d2, BigInt&& c) {
+   check_rsa_private_key_params(get_n(), p, q);
+
+   /*
+   * RFC 8017 Section 3.2
+   *
+   *    The RSA private exponent d is a positive integer less than n
+   *    [...]
+   *    the CRT exponents dP and dQ are positive integers less than p and q,
+   *    respectively,
+   *    [...]
+   *    the CRT coefficient qInv is a positive integer less than p
+   */
+   if(d < 2 || d >= get_n()) {
+      throw Decoding_Error("Invalid RSA private key exponent");
+   }
+   if(d1 < 1 || d1 >= p || d2 < 1 || d2 >= q || c < 1 || c >= p) {
+      throw Decoding_Error("Invalid RSA private key CRT parameters");
+   }
+
+   m_private = std::make_shared<RSA_Private_Data>(
+      m_public, std::move(d), std::move(p), std::move(q), std::move(d1), std::move(d2), std::move(c));
+}
+
+RSA_PrivateKey::RSA_PrivateKey(const AlgorithmIdentifier& alg_id, std::span<const uint8_t> key_bits) {
+   if(alg_id.oid().registered_name() == "RSA" && !alg_id.parameters_are_null_or_empty()) {
+      throw Decoding_Error("Unexpected parameters for RSA private key");
+   }
+
+   BigInt n;
+   BigInt e;
+   BigInt d;
+   BigInt p;
+   BigInt q;
+   BigInt d1;
+   BigInt d2;
+   BigInt c;
+
+   BER_Decoder(key_bits, BER_Decoder::Limits::DER())
+      .start_sequence()
+      .decode_and_check<size_t>(0, "Unknown PKCS #1 key format version")
+      .decode(n)
+      .decode(e)
+      .decode(d)
+      .decode(p)
+      .decode(q)
+      .decode(d1)
+      .decode(d2)
+      .decode(c)
+      .end_cons()
+      .verify_end();
+
+   RSA_PublicKey::init(std::move(n), std::move(e));
+
+   RSA_PrivateKey::init(std::move(d), std::move(p), std::move(q), std::move(d1), std::move(d2), std::move(c));
+
+   check_rsa_secret_exponent(get_e(), get_d(), get_p(), get_q());
+}
+
+RSA_PrivateKey::RSA_PrivateKey(
+   const BigInt& prime1, const BigInt& prime2, const BigInt& exp, const BigInt& d_exp, const BigInt& mod) {
+   BigInt p = prime1;
+   BigInt q = prime2;
+   BigInt n = mod;
+   if(n.is_zero()) {
+      n = p * q;
+   }
+
+   BigInt e = exp;
+
+   RSA_PublicKey::init(std::move(n), std::move(e));
+
+   // Validated early since the arithmetic below depends on it
+   check_rsa_private_key_params(get_n(), p, q);
+
+   BigInt d = d_exp;
+   const bool compute_d = d.is_zero();
+
+   if(!compute_d) {
+      check_rsa_secret_exponent(get_e(), d, p, q);
+   }
+
+   CT::poison_all(p, q, d);
+
+   const BigInt p_minus_1 = p - 1;
+   const BigInt q_minus_1 = q - 1;
+
+   if(compute_d) {
+      const BigInt phi_n = lcm(p_minus_1, q_minus_1);
+      if(auto d_inv = compute_rsa_secret_exponent(get_e(), phi_n, p, q)) {
+         d = std::move(*d_inv);
+      } else {
+         throw Decoding_Error("Invalid RSA private key: e has no inverse modulo lcm(p-1, q-1)");
+      }
+   }
+
+   BigInt d1 = ct_modulo(d, p_minus_1);
+   BigInt d2 = ct_modulo(d, q_minus_1);
+
+   const BigInt q_mod_p = ct_modulo(q, p);
+   if(q_mod_p.is_zero()) {
+      throw Decoding_Error("Invalid RSA private key: p divides q");
+   }
+   BigInt c = inverse_mod_secret_prime(q_mod_p, p);
+
+   CT::unpoison_all(p, q, d, d1, d2, c);
+
+   RSA_PrivateKey::init(std::move(d), std::move(p), std::move(q), std::move(d1), std::move(d2), std::move(c));
+}
+
+/*
+* Create a RSA private key
+*/
+RSA_PrivateKey::RSA_PrivateKey(RandomNumberGenerator& rng, size_t bits, size_t exp) {
+   constexpr size_t MIN_RSA_BITS = 1024;
+   constexpr size_t MOD_RSA_BITS = 8;
+
+   if(bits < MIN_RSA_BITS) {
+      throw Invalid_Argument(fmt("Cannot create an RSA key of {} bits: must be at least {} bits", bits, MIN_RSA_BITS));
+   } else if(bits > MAX_RSA_BITS) {
+      throw Invalid_Argument(
+         fmt("Cannot create an RSA key of {} bits: must be no more than {} bits", bits, MAX_RSA_BITS));
+   } else if(bits % MOD_RSA_BITS != 0) {
+      throw Invalid_Argument(
+         fmt("Cannot create an RSA key of {} bits: must be a multiple of {} bits", bits, MOD_RSA_BITS));
+   }
+
+   if(exp < 3 || exp % 2 == 0) {
+      throw Invalid_Argument("Invalid RSA encryption exponent");
+   }
+
+   const size_t p_bits = (bits + 1) / 2;
+   const size_t q_bits = bits - p_bits;
+
+   BigInt p;
+   BigInt q;
+   BigInt n;
+   BigInt e = BigInt::from_u64(exp);
+
+   for(size_t attempt = 0;; ++attempt) {
+      if(attempt > 10) {
+         throw Internal_Error("RNG failure during RSA key generation");
+      }
+
+      // TODO could generate primes in thread pool
+      p = generate_rsa_prime(rng, rng, p_bits, e);
+      q = generate_rsa_prime(rng, rng, q_bits, e);
+      CT::poison_all(p, q);
+
+      const BigInt diff = p - q;
+      if(diff.bits() < (bits / 2) - 100) {
+         continue;
+      }
+
+      n = p * q;
+      CT::unpoison(n);
+
+      if(n.bits() != bits) {
+         continue;
+      }
+
+      break;
+   }
+
+   const BigInt p_minus_1 = p - 1;
+   const BigInt q_minus_1 = q - 1;
+
+   const BigInt phi_n = lcm(p_minus_1, q_minus_1);
+   // This is guaranteed because p,q == 3 mod 4
+   BOTAN_DEBUG_ASSERT(low_zero_bits(phi_n) == 1);
+
+   // generate_rsa_prime ensures gcd(e, p-1) == gcd(e, q-1) == 1 so the inverse exists
+   auto d = compute_rsa_secret_exponent(e, phi_n, p, q);
+   BOTAN_ASSERT_NOMSG(d.has_value());
+
+   BigInt d1 = ct_modulo(*d, p_minus_1);
+   BigInt d2 = ct_modulo(*d, q_minus_1);
+   BigInt c = inverse_mod_secret_prime(ct_modulo(q, p), p);
+
+   CT::unpoison_all(p, q, *d, d1, d2, c);
+
+   RSA_PublicKey::init(std::move(n), std::move(e));
+
+   RSA_PrivateKey::init(std::move(*d), std::move(p), std::move(q), std::move(d1), std::move(d2), std::move(c));
+}
+
+const BigInt& RSA_PrivateKey::get_int_field(std::string_view field) const {
+   if(field == "p") {
+      return m_private->get_p();
+   } else if(field == "q") {
+      return m_private->get_q();
+   } else if(field == "d") {
+      return m_private->get_d();
+   } else if(field == "c") {
+      return m_private->get_c();
+   } else if(field == "d1") {
+      return m_private->get_d1();
+   } else if(field == "d2") {
+      return m_private->get_d2();
+   } else {
+      return RSA_PublicKey::get_int_field(field);
+   }
+}
+
+std::unique_ptr<Public_Key> RSA_PrivateKey::public_key() const {
+   return std::make_unique<RSA_PublicKey>(get_n(), get_e());
+}
+
+/*
+* Check Private RSA Parameters
+*/
+bool RSA_PrivateKey::check_key(RandomNumberGenerator& rng, bool strong) const {
+   if(get_n() < 35 || get_n().is_even() || get_e() < 3 || get_e().is_even()) {
+      return false;
+   }
+
+   const auto scope = CT::scoped_poison(*m_private);
+
+   if(get_d() < 2 || get_p() < 3 || get_q() < 3) {
+      return false;
+   }
+
+   if(get_p() * get_q() != get_n()) {
+      return false;
+   }
+
+   if(get_p() == get_q()) {
+      return false;
+   }
+
+   if(get_d1() != ct_modulo(get_d(), get_p() - 1)) {
+      return false;
+   }
+   if(get_d2() != ct_modulo(get_d(), get_q() - 1)) {
+      return false;
+   }
+   if(get_c() != inverse_mod_secret_prime(ct_modulo(get_q(), get_p()), get_p())) {
+      return false;
+   }
+
+   const size_t prob = (strong) ? 128 : 12;
+
+   if(!is_prime(get_p(), rng, prob)) {
+      return false;
+   }
+   if(!is_prime(get_q(), rng, prob)) {
+      return false;
+   }
+
+   if(strong) {
+      if(ct_modulo(get_e() * get_d(), lcm(get_p() - 1, get_q() - 1)) != 1) {
+         return false;
+      }
+
+#if defined(BOTAN_HAS_PSS) && defined(BOTAN_HAS_SHA_256)
+      const std::string padding = "PSS(SHA-256)";
+#else
+      const std::string padding = "Raw";
+#endif
+
+      return KeyPair::signature_consistency_check(rng, *this, padding);
+   }
+
+   return true;
+}
+
+namespace {
+
+/**
+* RSA private (decrypt/sign) operation
+*/
+class RSA_Private_Operation {
+   protected:
+      size_t public_modulus_bits() const { return m_public->public_modulus_bits(); }
+
+      size_t public_modulus_bytes() const { return m_public->public_modulus_bytes(); }
+
+      explicit RSA_Private_Operation(const RSA_PrivateKey& rsa, RandomNumberGenerator& rng) :
+            m_public(rsa.public_data()),
+            m_private(rsa.private_data()),
+            m_rng(rng),
+            m_blinding_bits(64),
+            m_max_d1_bits(m_private->p_bits() + m_blinding_bits),
+            m_max_d2_bits(m_private->q_bits() + m_blinding_bits) {}
+
+      void raw_op(std::span<uint8_t> out, std::span<const uint8_t> input) {
+         // These early exits are fine because the invalidity is based only
+         // on public information, namely the ciphertext and the public modulus
+         if(input.size() > public_modulus_bytes()) {
+            throw Decoding_Error("RSA input is too long for this key");
+         }
+         const BigInt input_bn(input.data(), input.size());
+         if(input_bn.is_zero() || input_bn >= m_public->get_n()) {
+            throw Decoding_Error("RSA input is not in the valid range");
+         }
+
+         const auto scope = CT::scoped_poison(*m_private);
+
+         const auto [blind_fwd, blind_inv] = m_private->next_blinding_pair(m_rng);
+         const auto& mod_n = m_public->reducer_mod_n();
+
+         const BigInt recovered = mod_n.multiply(rsa_private_op(mod_n.multiply(input_bn, blind_fwd)), blind_inv);
+         // Any further secret handling of the output is up to the caller
+         CT::unpoison(recovered);
+         BOTAN_ASSERT(input_bn == m_public->public_op(recovered), "RSA consistency check");
+         BOTAN_ASSERT(m_public->public_modulus_bytes() == out.size(), "output size check");
+         recovered.serialize_to(out);
+      }
+
+   private:
+      BigInt rsa_private_op(const BigInt& m) const {
+         /*
+         All normal implementations generate p/q of the same bitlength,
+         so this should rarely occur in practice
+         */
+         if(m_private->primes_imbalanced()) {
+            return monty_exp(m_public->monty_n(), m, m_private->get_d(), m_public->get_n().bits()).value();
+         }
+
+         static constexpr size_t powm_window = 4;
+
+         // Compute this in main thread to avoid racing on the rng
+         const BigInt d1_mask(m_rng, m_blinding_bits);
+         CT::poison(d1_mask);
+
+#if defined(BOTAN_RSA_USE_ASYNC)
+         /*
+         * Precompute m.sig_words in the main thread before calling async. Otherwise
+         * the two threads race (during Barrett_Reduction::reduce) and while the output
+         * is correct in both threads, helgrind warns.
+         */
+         m.sig_words();
+
+         auto future_j1 = Thread_Pool::global_instance().run([this, &m, &d1_mask]() {
+#endif
+            const BigInt masked_d1 = m_private->blinded_d1(d1_mask);
+            const auto powm_d1_p =
+               monty_precompute(Montgomery_Int::from_wide_int(m_private->monty_p(), m), powm_window);
+            auto j1 = monty_execute(*powm_d1_p, masked_d1, m_max_d1_bits);
+
+#if defined(BOTAN_RSA_USE_ASYNC)
+            return j1;
+         });
+#endif
+
+         const BigInt d2_mask(m_rng, m_blinding_bits);
+         CT::poison(d2_mask);
+         const BigInt masked_d2 = m_private->blinded_d2(d2_mask);
+         const auto powm_d2_q = monty_precompute(Montgomery_Int::from_wide_int(m_private->monty_q(), m), powm_window);
+         const auto j2 = monty_execute(*powm_d2_q, masked_d2, m_max_d2_bits).value();
+
+#if defined(BOTAN_RSA_USE_ASYNC)
+         const auto j1 = future_j1.get();
+#endif
+
+         // Reduce j2 modulo p
+         const auto j2_p = Montgomery_Int::from_wide_int(m_private->monty_p(), j2);
+
+         return crt_recombine(j1, j2_p, j2, m_private->get_c_monty(), m_private->get_p(), m_private->get_q());
+      }
+
+      std::shared_ptr<const RSA_Public_Data> m_public;
+      std::shared_ptr<const RSA_Private_Data> m_private;
+
+      RandomNumberGenerator& m_rng;
+      const size_t m_blinding_bits;
+      const size_t m_max_d1_bits;
+      const size_t m_max_d2_bits;
+};
+
+class RSA_Signature_Operation final : public PK_Ops::Signature,
+                                      private RSA_Private_Operation {
+   public:
+      void update(std::span<const uint8_t> msg) override { m_padding->update(msg.data(), msg.size()); }
+
+      std::vector<uint8_t> sign(RandomNumberGenerator& rng) override {
+         const size_t max_input_bits = public_modulus_bits() - 1;
+         const auto msg = m_padding->raw_data();
+         const auto padded = m_padding->encoding_of(msg, max_input_bits, rng);
+
+         std::vector<uint8_t> out(public_modulus_bytes());
+         raw_op(out, padded);
+         return out;
+      }
+
+      size_t signature_length() const override { return public_modulus_bytes(); }
+
+      AlgorithmIdentifier algorithm_identifier() const override;
+
+      std::string hash_function() const override {
+         BOTAN_ASSERT_NONNULL(m_padding);
+         return m_padding->hash_function();
+      }
+
+      RSA_Signature_Operation(const RSA_PrivateKey& rsa,
+                              const PK_Signature_Options_Reader& options,
+                              RandomNumberGenerator& rng) :
+            RSA_Private_Operation(rsa, rng), m_padding(SignaturePaddingScheme::create_or_throw(options)) {}
+
+   private:
+      std::unique_ptr<SignaturePaddingScheme> m_padding;
+};
+
+AlgorithmIdentifier RSA_Signature_Operation::algorithm_identifier() const {
+   const std::string padding_name = m_padding->name();
+
+   try {
+      const std::string full_name = "RSA/" + padding_name;
+      const OID oid = OID::from_string(full_name);
+      // RFC 8017 Appendix A.2 specifies RSA signatures for most hashes use NULL parameter
+      return AlgorithmIdentifier(oid, AlgorithmIdentifier::USE_NULL_PARAM);
+   } catch(Lookup_Error&) {}
+
+   if(padding_name.starts_with("PSS(")) {
+      const auto parameters = PSS_Params::from_padding_name(m_padding->name()).serialize();
+      return AlgorithmIdentifier("RSA/PSS", parameters);
+   }
+
+   throw Invalid_Argument(fmt("Signatures using RSA/{} are not supported", padding_name));
+}
+
+class RSA_Decryption_Operation final : public PK_Ops::Decryption_with_Padding,
+                                       private RSA_Private_Operation {
+   public:
+      RSA_Decryption_Operation(const RSA_PrivateKey& rsa,
+                               const PK_Encryption_Options_Reader& options,
+                               RandomNumberGenerator& rng) :
+            PK_Ops::Decryption_with_Padding(options), RSA_Private_Operation(rsa, rng) {}
+
+      size_t plaintext_length(size_t /*ctext_len*/) const override { return public_modulus_bytes(); }
+
+      size_t ciphertext_length(size_t /*ptext_len*/) const override { return public_modulus_bytes(); }
+
+      secure_vector<uint8_t> raw_decrypt(std::span<const uint8_t> input) override {
+         /*
+         * RFC 8017 7.1.2 and 7.2.2
+         *
+         *  If the length of the ciphertext C is not k octets, output
+         *  "decryption error" and stop.
+         */
+         if(input.size() != public_modulus_bytes()) {
+            throw Decoding_Error("RSA ciphertext is an incorrect size for this public key");
+         }
+         secure_vector<uint8_t> out(public_modulus_bytes());
+         raw_op(out, input);
+         return out;
+      }
+};
+
+class RSA_KEM_Decryption_Operation final : public PK_Ops::KEM_Decryption_with_KDF,
+                                           private RSA_Private_Operation {
+   public:
+      RSA_KEM_Decryption_Operation(const RSA_PrivateKey& key,
+                                   const PK_KEM_Options_Reader& options,
+                                   RandomNumberGenerator& rng) :
+            PK_Ops::KEM_Decryption_with_KDF(options, PK_Ops::KemSharedKeyQuality::RequiresKDF),
+            RSA_Private_Operation(key, rng) {}
+
+      size_t raw_kem_shared_key_length() const override { return public_modulus_bytes(); }
+
+      size_t encapsulated_key_length() const override { return public_modulus_bytes(); }
+
+      void raw_kem_decrypt(std::span<uint8_t> out_shared_key, std::span<const uint8_t> encapsulated_key) override {
+         /*
+         * RFC 9690 Section 8
+         *
+         *    The RSA-KEM algorithm provides a fixed-length ciphertext. The recipient MUST
+         *    check that the received byte string is the expected length [...]
+         *
+         * This length check is based only on public information (the encapsulated key and
+         * the public modulus) so an early exit does not leak anything.
+         */
+         if(encapsulated_key.size() != public_modulus_bytes()) {
+            throw Decoding_Error("Invalid RSA-KEM ciphertext length");
+         }
+         raw_op(out_shared_key, encapsulated_key);
+      }
+};
+
+/**
+* RSA public (encrypt/verify) operation
+*/
+class RSA_Public_Operation {
+   public:
+      explicit RSA_Public_Operation(const RSA_PublicKey& rsa) : m_public(rsa.public_data()) {}
+
+      size_t public_modulus_bits() const { return m_public->public_modulus_bits(); }
+
+   protected:
+      BigInt public_op(const BigInt& m) const {
+         if(m >= m_public->get_n()) {
+            throw Decoding_Error("RSA public op - input is too large");
+         }
+
+         return m_public->public_op(m);
+      }
+
+      size_t public_modulus_bytes() const { return m_public->public_modulus_bytes(); }
+
+      const BigInt& get_n() const { return m_public->get_n(); }
+
+   private:
+      std::shared_ptr<const RSA_Public_Data> m_public;
+};
+
+class RSA_Encryption_Operation final : public PK_Ops::Encryption_with_Padding,
+                                       private RSA_Public_Operation {
+   public:
+      RSA_Encryption_Operation(const RSA_PublicKey& rsa, const PK_Encryption_Options_Reader& options) :
+            PK_Ops::Encryption_with_Padding(options), RSA_Public_Operation(rsa) {}
+
+      size_t ciphertext_length(size_t /*ptext_len*/) const override { return public_modulus_bytes(); }
+
+      size_t max_ptext_input_bits() const override { return public_modulus_bits() - 1; }
+
+      std::vector<uint8_t> raw_encrypt(std::span<const uint8_t> input, RandomNumberGenerator& /*rng*/) override {
+         const BigInt input_bn(input);
+         CT::poison(input_bn);
+         const BigInt c = public_op(input_bn);
+         CT::unpoison(c);
+         return c.serialize(public_modulus_bytes());
+      }
+};
+
+class RSA_Verify_Operation final : public PK_Ops::Verification,
+                                   private RSA_Public_Operation {
+   public:
+      void update(std::span<const uint8_t> msg) override { m_padding->update(msg.data(), msg.size()); }
+
+      bool is_valid_signature(std::span<const uint8_t> sig) override {
+         const auto msg = m_padding->raw_data();
+         const auto message_repr = recover_message_repr(sig.data(), sig.size());
+         return m_padding->verify(message_repr, msg, public_modulus_bits() - 1);
+      }
+
+      RSA_Verify_Operation(const RSA_PublicKey& rsa, const PK_Signature_Options_Reader& options) :
+            RSA_Public_Operation(rsa), m_padding(SignaturePaddingScheme::create_or_throw(options)) {}
+
+      std::string hash_function() const override { return m_padding->hash_function(); }
+
+   private:
+      std::vector<uint8_t> recover_message_repr(const uint8_t input[], size_t input_len) {
+         // RFC 8017 8.1.2 and 8.2.2 state
+         //    If the length of the signature S is not k octets,
+         //    output "invalid signature" and stop.
+         //
+         if(input_len != public_modulus_bytes()) {
+            throw Decoding_Error("RSA signature is an incorrect size for this public key");
+         }
+         const BigInt input_bn(input, input_len);
+         return public_op(input_bn).serialize();
+      }
+
+      std::unique_ptr<SignaturePaddingScheme> m_padding;
+};
+
+class RSA_KEM_Encryption_Operation final : public PK_Ops::KEM_Encryption_with_KDF,
+                                           private RSA_Public_Operation {
+   public:
+      RSA_KEM_Encryption_Operation(const RSA_PublicKey& key, const PK_KEM_Options_Reader& options) :
+            PK_Ops::KEM_Encryption_with_KDF(options, PK_Ops::KemSharedKeyQuality::RequiresKDF),
+            RSA_Public_Operation(key) {}
+
+   private:
+      size_t raw_kem_shared_key_length() const override { return public_modulus_bytes(); }
+
+      size_t encapsulated_key_length() const override { return public_modulus_bytes(); }
+
+      void raw_kem_encrypt(std::span<uint8_t> out_encapsulated_key,
+                           std::span<uint8_t> raw_shared_key,
+                           RandomNumberGenerator& rng) override {
+         const BigInt r = BigInt::random_integer(rng, BigInt::one(), get_n());
+         CT::poison(r);
+         const BigInt c = public_op(r);
+         CT::unpoison(c);
+
+         c.serialize_to(out_encapsulated_key);
+         r.serialize_to(raw_shared_key);
+         CT::unpoison(raw_shared_key);
+      }
+};
+
+}  // namespace
+
+std::unique_ptr<PK_Ops::Encryption> RSA_PublicKey::_create_encryption_op(
+   RandomNumberGenerator& rng, const PK_Encryption_Options_Reader& options) const {
+   BOTAN_UNUSED(rng);
+   require_software_provider(options, algo_name());
+
+   return std::make_unique<RSA_Encryption_Operation>(*this, options);
+}
+
+std::unique_ptr<PK_Ops::KEM_Encryption> RSA_PublicKey::_create_kem_encryption_op(
+   const PK_KEM_Options_Reader& options) const {
+   require_software_provider(options, algo_name());
+
+   return std::make_unique<RSA_KEM_Encryption_Operation>(*this, options);
+}
+
+std::unique_ptr<PK_Ops::Verification> RSA_PublicKey::_create_verification_op(
+   const PK_Signature_Options_Reader& options) const {
+   require_software_provider(options, algo_name());
+
+   return std::make_unique<RSA_Verify_Operation>(*this, options);
+}
+
+namespace {
+
+PK_Signature_Options parse_rsa_signature_algorithm(const AlgorithmIdentifier& alg_id) {
+   const auto oid_name = alg_id.oid().registered_name();
+   if(!oid_name) {
+      throw Decoding_Error("Unknown AlgorithmIdentifier for RSA X.509 signatures");
+   }
+
+   const auto sig_info = split_on(*oid_name, '/');
+
+   if(sig_info.empty() || sig_info.size() != 2 || sig_info[0] != "RSA") {
+      throw Decoding_Error("Unknown AlgorithmIdentifier for RSA X.509 signatures");
+   }
+
+   const std::string& padding = sig_info[1];
+
+   if(padding != "PSS") {
+      if(!alg_id.parameters_are_null_or_empty()) {
+         throw Decoding_Error("Non-PSS RSA signature algorithm OID has unexpected parameters");
+      }
+   }
+
+   if(padding == "PSS") {
+      // "MUST contain RSASSA-PSS-params"
+      if(alg_id.parameters().empty()) {
+         throw Decoding_Error("PSS params must be provided");
+      }
+
+      const PSS_Params pss_params(alg_id.parameters());
+
+      // hash_algo must be SHA1, SHA2-224, SHA2-256, SHA2-384 or SHA2-512
+      // We also support SHA-3 (is also supported by e.g. OpenSSL and bouncycastle)
+      const auto hash_algo = pss_params.hash_algid().oid().registered_name();
+      if(hash_algo != "SHA-1" && hash_algo != "SHA-224" && hash_algo != "SHA-256" && hash_algo != "SHA-384" &&
+         hash_algo != "SHA-512" && hash_algo != "SHA-3(224)" && hash_algo != "SHA-3(256)" &&
+         hash_algo != "SHA-3(384)" && hash_algo != "SHA-3(512)") {
+         throw Decoding_Error("Unacceptable hash for PSS signatures");
+      }
+
+      if(pss_params.mgf_algid().oid().registered_name() != "MGF1") {
+         throw Decoding_Error("Unacceptable MGF for PSS signatures");
+      }
+
+      // For MGF1, it is strongly RECOMMENDED that the underlying hash
+      // function be the same as the one identified by hashAlgorithm
+      if(pss_params.hash_algid() != pss_params.mgf_hash_algid()) {
+         throw Decoding_Error("Unacceptable MGF hash for PSS signatures");
+      }
+
+      if(pss_params.trailer_field() != 1) {
+         throw Decoding_Error("Unacceptable trailer field for PSS signatures");
+      }
+
+      return PK_Signature_Options().with_padding("PSS").with_hash(*hash_algo).with_salt_size(pss_params.salt_length());
+   } else {
+      const AlgorithmSpec spec(padding);
+
+      const auto m = spec.match("PKCS1v15({hash})");
+      if(!m) {
+         throw Decoding_Error("Unexpected OID for RSA signatures");
+      }
+
+      return PK_Signature_Options().with_padding("PKCS1v15").with_hash(m->str("hash"));
+   }
+}
+
+}  // namespace
+
+std::unique_ptr<PK_Ops::Verification> RSA_PublicKey::create_x509_verification_op(const AlgorithmIdentifier& alg_id,
+                                                                                 std::string_view provider) const {
+   if(provider == "base" || provider.empty()) {
+      return std::make_unique<RSA_Verify_Operation>(
+         *this, PK_Options_Reader_Access::for_verification(parse_rsa_signature_algorithm(alg_id)));
+   }
+
+   throw Provider_Not_Found(algo_name(), provider);
+}
+
+std::unique_ptr<PK_Ops::Decryption> RSA_PrivateKey::_create_decryption_op(
+   RandomNumberGenerator& rng, const PK_Encryption_Options_Reader& options) const {
+   require_software_provider(options, algo_name());
+
+   return std::make_unique<RSA_Decryption_Operation>(*this, options, rng);
+}
+
+std::unique_ptr<PK_Ops::KEM_Decryption> RSA_PrivateKey::_create_kem_decryption_op(
+   RandomNumberGenerator& rng, const PK_KEM_Options_Reader& options) const {
+   require_software_provider(options, algo_name());
+
+   return std::make_unique<RSA_KEM_Decryption_Operation>(*this, options, rng);
+}
+
+std::unique_ptr<PK_Ops::Signature> RSA_PrivateKey::_create_signature_op(
+   RandomNumberGenerator& rng, const PK_Signature_Options_Reader& options) const {
+   require_software_provider(options, algo_name());
+
+   return std::make_unique<RSA_Signature_Operation>(*this, options, rng);
+}
+
+}  // namespace Botan

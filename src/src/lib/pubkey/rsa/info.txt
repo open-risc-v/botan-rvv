@@ -1,0 +1,18 @@
+<defines>
+RSA -> 20160730
+</defines>
+
+<module_info>
+name -> "RSA"
+</module_info>
+
+<requires>
+keypair
+numbertheory
+sig_padding
+enc_padding
+</requires>
+
+<header:public>
+rsa.h
+</header:public>

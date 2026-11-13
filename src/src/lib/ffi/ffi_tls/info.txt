@@ -1,0 +1,22 @@
+<defines>
+FFI_TLS -> 20260916
+</defines>
+
+<module_info>
+name -> "Foreign Function Interface TLS"
+brief -> "C API for Botan's TLS implementation (experimental)"
+lifecycle -> "Experimental"
+</module_info>
+
+<header:public>
+ffi_tls.h
+</header:public>
+
+<header:internal>
+ffi_tls_impl.h
+</header:internal>
+
+<requires>
+ffi
+tls
+</requires>
