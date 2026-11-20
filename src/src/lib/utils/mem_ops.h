@@ -9,6 +9,10 @@
 #define BOTAN_MEMORY_OPS_H_
 
 #include <botan/assert.h>
+
+#if defined(RVV_KERNELS) && defined(__riscv_v)
+#include "xor_rvv.h"
+#endif
 #include <botan/range_concepts.h>
 #include <botan/types.h>
 #include <array>
@@ -468,6 +472,9 @@ inline constexpr void xor_buf(ranges::contiguous_output_range<uint8_t> auto&& ou
 * @param length the length of the buffers
 */
 inline void xor_buf(uint8_t out[], const uint8_t in[], size_t length) {
+#if defined(RVV_KERNELS) && defined(__riscv_v)
+   if(length >= 64) { rvv_xor_inplace(out, in, length); return; }
+#endif
    // simply assumes that *out and *in point to "length" allocated bytes at least
    xor_buf(std::span{out, length}, std::span{in, length});
 }
@@ -480,6 +487,9 @@ inline void xor_buf(uint8_t out[], const uint8_t in[], size_t length) {
 * @param length the length of the three buffers
 */
 inline void xor_buf(uint8_t out[], const uint8_t in[], const uint8_t in2[], size_t length) {
+#if defined(RVV_KERNELS) && defined(__riscv_v)
+   if(length >= 64) { rvv_xor_out(out, in, in2, length); return; }
+#endif
    // simply assumes that *out, *in, and *in2 point to "length" allocated bytes at least
    xor_buf(std::span{out, length}, std::span{in, length}, std::span{in2, length});
 }

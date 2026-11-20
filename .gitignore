@@ -7,3 +7,8 @@ build/
 *.out
 *.raw
 .DS_Store
+b3-cpu/
+b3-rvv/
+b3-rvvnovec/
+bld-cpu/
+bld-rvv/

@@ -5,6 +5,10 @@
 set -euo pipefail
 SRC=$1
 OUT=$2
+MARCH=${3:-rv64gcv}
+KERN=${4:-0}
+EXTRA_CXX=()
+if [ "$KERN" = "1" ]; then EXTRA_CXX=("--extra-cxxflags=-march=${MARCH} -DRVV_KERNELS=1 -Isrc/riscv -Isrc/src/riscv"); fi
 rm -rf "${OUT}"
 mkdir -p "${OUT}/prefix" "${OUT}/src"
 cp -R "${SRC}" "${OUT}/src/pkg"
@@ -17,7 +21,7 @@ fi
 python3 configure.py --prefix="${OUT}/prefix" ${HOST_ARG} \
   --build-targets=static --without-documentation --disable-shared \
   --minimized-build --enable-modules=sha2_32,aes,ctr \
-  --cpu=generic >/dev/null
+  --cpu=generic "${EXTRA_CXX[@]}" >/dev/null
 make -j"$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)" >/dev/null 2>&1
 make install >/dev/null 2>&1
 echo "== 上游 botan 构建完成：${OUT}/prefix"
